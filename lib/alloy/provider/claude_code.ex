@@ -1,0 +1,901 @@
+defmodule Alloy.Provider.ClaudeCode do
+  @moduledoc """
+  Provider for Claude-subscription-backed execution via `claude -p` (headless
+  print mode).
+
+  This provider treats Claude Code as a structured completion backend rather
+  than a full agent runtime. Alloy remains responsible for the tool loop,
+  while Claude Code receives the current transcript and available tool
+  definitions, then returns JSON describing either a final assistant response
+  or one or more tool calls.
+
+  ## Config
+
+  Required:
+  - `:model` - Claude model name or alias (for example `"claude-sonnet-5"`,
+    `"sonnet"`, `"opus"`)
+
+  Optional:
+  - `:claude_bin` - Executable path (default: `"claude"`)
+  - `:workdir` - Directory passed to `claude` (defaults to a temp dir). Always
+    a throwaway directory unless overridden, so no `CLAUDE.md` from an
+    unrelated project is auto-discovered from the working directory. Pass the
+    *same* stable directory on every call for one conversation to get the
+    `--resume` cache benefit described below - the default (fresh temp dir
+    per call) makes `--resume` correct but free of any cost benefit.
+  - `:config_dir` - Override `CLAUDE_CONFIG_DIR` for the invocation. Not set
+    by default - see the macOS note below.
+  - `:settings_path` - Passed through as `--settings <path>` when present
+  - `:tmp_dir` - Parent for the provider's temp working directory
+    (default: `System.tmp_dir!/0`)
+  - `:timeout_ms` - Timeout for a single `claude` invocation
+    (default: `120_000`)
+  - `:receive_timeout` - Optional turn deadline timeout injected by Alloy's
+    retry loop; when present it caps `:timeout_ms`
+  - `:command_runner` - Test hook matching `System.cmd/3`
+  - `:system_prompt` - Appended to the session via `--append-system-prompt`
+    (in addition to being embedded in the transcript payload, same as Codex)
+
+  ## Tool suppression
+
+  Every invocation is run with `--tools ""`, `--strict-mcp-config`,
+  `--safe-mode`, and `--permission-prompts none`. This is load-bearing, not a
+  hardening afterthought: if Claude Code retained any of its own built-in
+  tools it would go do the requested work itself and return a prose summary,
+  instead of returning `tool_use` blocks for Alloy's loop to execute. That
+  silently breaks the provider contract - the response still validates
+  against the schema, so it fails as *wrong output*, not as an error. These
+  flags are fixed and are not exposed as config; there is no supported way
+  to give this provider real tool access.
+
+  **Deliberately not `--permission-mode plan`.** An earlier version of this
+  provider set it, reasoning it was the closest documented value to
+  "deny-equivalent." It is not a permission *level* at all - it is Claude
+  Code's actual interactive Plan Mode persona, and it actively breaks
+  structured output: combined with `--json-schema` in a resumed or
+  explicitly-`--session-id`'d call, the model started narrating its own
+  planning workflow ("I'm in **plan mode**... explore, design, create a plan
+  file, get approval... the StructuredOutput tool is meant to be called once
+  at the *end*") instead of answering, in a response that still validated
+  against the schema - the exact "fails as wrong output, not an error"
+  failure mode this section opens with, caught live rather than in theory.
+  `--tools ""` alone already guarantees zero tool capability regardless of
+  permission mode, so dropping the flag costs nothing; verified live that
+  tool suppression, plain completions, and resumed completions all still
+  behave correctly without it.
+
+  `--safe-mode` additionally disables `CLAUDE.md` auto-discovery, skills,
+  plugins, hooks, custom agents, and output styles for the invocation, without
+  touching credentials. That matters here specifically because Codex's trick
+  of copying `auth.json` into an isolated `CODEX_HOME` does not port to
+  Claude Code on macOS: credentials there live in the Keychain, not a file, so
+  pointing `CLAUDE_CONFIG_DIR` at an empty directory breaks login (confirmed
+  empirically: `claude` reports "Not logged in"). `--safe-mode` gets the same
+  isolation outcome (no ambient project config, no MCP passthrough) while
+  leaving auth alone on every platform, so `:config_dir` is left unset by
+  default rather than gated on `:os.type/0`. Pass `:config_dir` explicitly
+  only if you deliberately want a specific `CLAUDE_CONFIG_DIR` for this
+  invocation.
+
+  ## Session continuation (`--resume`)
+
+  Codex re-sends the entire transcript on every turn, with no cross-turn
+  caching - and this provider started out doing the same. Measured against
+  the real CLI, that costs roughly 7x more per follow-up turn than it needs
+  to: `claude -p --resume <session_id>` genuinely continues a prior
+  conversation (verified live - a codeword mentioned in turn 1 is recalled
+  correctly in turn 2 with no re-statement) and, when the working directory
+  is unchanged between calls, the shared prefix comes back as
+  `cache_read_input_tokens` instead of `cache_creation_input_tokens` - a real
+  prompt-cache hit, not just avoided re-transmission. Off-loop testing put a
+  resumed follow-up turn at ~$0.0019 against ~$0.013 for the same turn sent
+  fresh.
+
+  So this provider now resumes automatically, using the exact mechanism
+  `Alloy.Provider` was built for: `:provider_state`, already used by
+  `Alloy.Provider.OpenAI` for its own `previous_response_id` continuation.
+  Every successful turn returns `provider_state: %{session_id:, sent_upto:,
+  prefix_hash:}`, which `Alloy.Agent.Turn` merges into `config` on the next
+  call automatically - nothing else has to plumb it through.
+
+  On each call:
+  - If `config[:provider_state]` names a session and the first `sent_upto`
+    entries of the current `messages` hash-match `prefix_hash`, only the
+    messages *after* that point are serialized and sent with `--resume
+    <session_id>` - not the whole history.
+  - Otherwise (first call, a harness restart that resumed Alloy's own
+    messages but lost the CLI-side session, or a middleware like
+    `Alloy.Context.Compactor` rewriting earlier history so the hash no
+    longer matches) this falls back to the original behavior: the full
+    current `messages` list, no `--resume`, and a fresh session captured
+    from the response for next time. Resuming is a pure optimization; on any
+    doubt this provider prefers to pay full price over risking a resumed
+    turn built on a transcript Claude Code's own session no longer matches.
+
+  **The cache benefit requires a stable `:workdir` across calls.** Verified
+  live: resuming from a *different* directory than the original call still
+  correctly recalls conversation content (session lookup does not require a
+  matching cwd), but the prompt cache is never reused - full price every
+  time, even with `--exclude-dynamic-system-prompt-sections` (tried; did not
+  help). If `:workdir` is left at its default (a fresh temp dir every call,
+  same as Codex), `--resume` still works correctly but buys nothing - so a
+  caller that wants the cost benefit must pass the *same* `:workdir` on
+  every call for one conversation (CmsHarness's agents already have exactly
+  this: one persistent working copy per agent for its whole lifetime).
+
+  All per-invocation flags (`--tools`, `--safe-mode`, `--json-schema`,
+  `--model`, `--append-system-prompt`, ...) are still sent on *every* call,
+  resumed or not - Claude Code only resumes conversation content, not CLI
+  flags. Confirmed live that caching survives `--append-system-prompt` being
+  present on both calls, which matters here specifically because CmsHarness
+  always sets `:system_prompt`.
+
+  ## Notes
+
+  - Authentication is handled by the local `claude` CLI login state
+    (subscription OAuth or API key) - this provider never reads, copies, or
+    otherwise touches credentials.
+  - Usage accounting reflects the real numbers from the CLI's
+    `--output-format json` envelope (`usage.input_tokens` /
+    `usage.output_tokens`), unlike Codex's hardcoded zero usage, so
+    `max_budget_cents` guards work against this provider.
+  - Streaming is emulated by running a normal completion and replaying the
+    final text to the provided callback - same as Codex. Claude Code supports
+    real NDJSON streaming (`--output-format stream-json --include-partial-messages`)
+    but that is a separate piece of work, not implemented here.
+  """
+
+  @behaviour Alloy.Provider
+
+  alias Alloy.Message
+
+  @default_timeout_ms 120_000
+  @default_claude_bin "claude"
+  @output_truncation 4_000
+  @error_truncation 2_000
+  @zero_usage %{input_tokens: 0, output_tokens: 0}
+
+  # Matches any `\X` where X is NOT a valid JSON single-character escape
+  # (valid set: " \ / b f n r t u). Used by the decode repair pass.
+  @invalid_json_escape_re ~r{\\(?!["\\/bfnrtu])}
+
+  @response_schema %{
+    type: "object",
+    additionalProperties: false,
+    properties: %{
+      stop_reason: %{type: "string", enum: ["end_turn", "tool_use"]},
+      text: %{type: "string"},
+      tool_calls: %{
+        type: "array",
+        items: %{
+          type: "object",
+          additionalProperties: false,
+          properties: %{
+            call_id: %{type: "string"},
+            name: %{type: "string"},
+            arguments_json: %{type: "string"}
+          },
+          required: ["call_id", "name", "arguments_json"]
+        }
+      }
+    },
+    required: ["stop_reason", "text", "tool_calls"]
+  }
+
+  # Pre-encoded at compile time - the schema is static, no need to
+  # re-encode it on every `complete/3` call. `--json-schema` takes the JSON
+  # inline on the command line (verified against `claude --help`; there is
+  # no file-path form - passing a path fails with "not valid JSON").
+  @response_schema_json Jason.encode!(@response_schema)
+
+  @typedoc """
+  Configuration for the Claude Code provider. See the module doc for field
+  semantics.
+  """
+  @type config :: %{
+          required(:model) => String.t(),
+          optional(:claude_bin) => String.t(),
+          optional(:workdir) => String.t(),
+          optional(:config_dir) => String.t(),
+          optional(:settings_path) => String.t(),
+          optional(:tmp_dir) => String.t(),
+          optional(:timeout_ms) => pos_integer(),
+          optional(:receive_timeout) => pos_integer(),
+          optional(:system_prompt) => String.t(),
+          optional(:command_runner) => (String.t(), [String.t()], keyword() ->
+                                          {String.t(), integer()}),
+          optional(:provider_state) => map()
+        }
+
+  @impl true
+  @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  def complete(messages, tool_defs, config) do
+    case prepare_paths(config) do
+      {:ok, paths} ->
+        try do
+          resume = resume_plan(config, messages)
+          prompt = build_turn_prompt(resume, messages, tool_defs, config)
+
+          with :ok <- File.write(paths.prompt_path, prompt),
+               {:ok, command_result} <- run_claude(prompt, paths, config, resume),
+               {:ok, {structured_output, envelope}} <-
+                 read_payload_or_error(paths, command_result) do
+            parse_payload(structured_output, config, envelope, messages)
+          end
+        after
+          cleanup_paths(paths)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Whether this turn can continue a prior Claude Code session rather than
+  # re-sending the whole transcript. `:erlang.phash2/1` over the prefix we
+  # believe Claude Code already has is the safety check: if a middleware
+  # (compaction, most likely) rewrote earlier history since the last call,
+  # the hash no longer matches and this falls through to `:fresh` rather
+  # than resuming a session built on a transcript that no longer exists.
+  defp resume_plan(config, messages) do
+    with %{session_id: id, sent_upto: n, prefix_hash: hash} <-
+           Map.get(config, :provider_state),
+         true <- is_binary(id) and id != "",
+         true <- is_integer(n) and n >= 0,
+         true <- length(messages) > n,
+         true <- :erlang.phash2(Enum.take(messages, n)) == hash do
+      {:resume, id, Enum.drop(messages, n)}
+    else
+      _ -> :fresh
+    end
+  end
+
+  defp build_turn_prompt({:resume, _session_id, new_messages}, _messages, tool_defs, config) do
+    build_incremental_prompt(new_messages, tool_defs, config)
+  end
+
+  defp build_turn_prompt(:fresh, messages, tool_defs, config) do
+    build_prompt(messages, tool_defs, config)
+  end
+
+  @impl true
+  @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
+          {:ok, Alloy.Provider.completion_response()} | {:error, term()}
+  def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
+    with {:ok, result} <- complete(messages, tool_defs, config),
+         :ok <- emit_chunks(result, on_chunk) do
+      {:ok, result}
+    end
+  end
+
+  defp prepare_paths(config) do
+    base_dir = build_base_dir(config)
+
+    case mkdir_base(base_dir) do
+      :ok ->
+        {:ok, build_paths(base_dir, config)}
+
+      {:error, reason} ->
+        _ = File.rm_rf(base_dir)
+        {:error, reason}
+    end
+  end
+
+  defp build_base_dir(config) do
+    parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
+    Path.join(parent, "alloy-claude-code-#{System.unique_integer([:positive])}")
+  end
+
+  defp mkdir_base(base_dir) do
+    case File.mkdir_p(base_dir) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "failed to prepare Claude Code temp directory: #{inspect(reason)}"}
+    end
+  end
+
+  defp build_paths(base_dir, config) do
+    %{
+      base_dir: base_dir,
+      prompt_path: Path.join(base_dir, "prompt.txt"),
+      stderr_path: Path.join(base_dir, "stderr.txt"),
+      workdir: Map.get(config, :workdir, base_dir),
+      config_dir: Map.get(config, :config_dir)
+    }
+  end
+
+  defp cleanup_paths(%{base_dir: base_dir}) do
+    _ = File.rm_rf(base_dir)
+    :ok
+  end
+
+  defp run_claude(prompt, paths, config, resume) do
+    executable = Map.get(config, :claude_bin, @default_claude_bin)
+    timeout = effective_timeout(config)
+
+    args =
+      [
+        "-p",
+        "--output-format",
+        "json",
+        "--json-schema",
+        @response_schema_json,
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--safe-mode",
+        "--permission-prompts",
+        "none"
+      ]
+      |> maybe_append_model(config)
+      |> maybe_append_system_prompt(config)
+      |> maybe_append_settings(config)
+      |> maybe_append_resume(resume)
+      |> append_prompt_arg(prompt, config)
+
+    if injected_runner?(config) do
+      run_injected(config, executable, args, paths)
+    else
+      run_port(executable, args, paths, timeout)
+    end
+  end
+
+  defp effective_timeout(config) do
+    timeout_ms = Map.get(config, :timeout_ms, @default_timeout_ms)
+
+    case Map.get(config, :receive_timeout) do
+      receive_timeout when is_integer(receive_timeout) and receive_timeout > 0 ->
+        min(receive_timeout, timeout_ms)
+
+      _ ->
+        timeout_ms
+    end
+  end
+
+  # Test path: the caller supplies a synchronous function matching
+  # `System.cmd/3`. Its return value is treated as stdout - unlike Codex,
+  # there is no output file to intercept, since Claude Code's structured
+  # payload comes back on stdout itself.
+  defp run_injected(config, executable, args, paths) do
+    runner = Map.fetch!(config, :command_runner)
+    opts = [cd: paths.workdir, stderr_to_stdout: false]
+
+    case runner.(executable, args, opts) do
+      {output, status} when is_binary(output) and is_integer(status) ->
+        {:ok, %{output: output, status: status}}
+
+      other ->
+        {:error, "claude exec returned unexpected result: #{inspect(other)}"}
+    end
+  rescue
+    error in ErlangError ->
+      {:error, "claude exec failed to start: #{Exception.message(error)}"}
+  end
+
+  # Real path: spawn via Port so we capture the OS pid and can kill the
+  # subprocess on timeout. `exec env ... claude ...` makes the shell process
+  # replace itself with env, which replaces itself with claude - so
+  # `Port.info(:os_pid)` returns claude's own pid rather than a shell pid
+  # whose children we'd otherwise orphan.
+  #
+  # stderr is redirected to a file by the shell command itself (not merged
+  # into stdout via Port options) so that stray diagnostic output can never
+  # corrupt the single JSON result object `--output-format json` writes to
+  # stdout.
+  defp run_port(executable, args, paths, timeout) do
+    shell_command = build_port_command(executable, args, paths)
+
+    port =
+      Port.open(
+        {:spawn_executable, "/bin/sh"},
+        [
+          {:args, ["-lc", shell_command]},
+          {:cd, paths.workdir},
+          :binary,
+          :exit_status,
+          :use_stdio
+        ]
+      )
+
+    # Port.info/2 returns nil when the process already exited - its output
+    # and exit_status messages are still in the mailbox, so collect them;
+    # there is just no OS pid left to kill on timeout.
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, [])
+      nil -> collect_port(port, nil, timeout, [])
+    end
+  rescue
+    error in ErlangError ->
+      {:error, "claude exec failed to start: #{Exception.message(error)}"}
+  end
+
+  defp build_port_command(executable, args, paths) do
+    env_args =
+      [{"CLAUDE_CONFIG_DIR", paths.config_dir}]
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Enum.map_join(" ", fn {key, value} -> shell_escape("#{key}=#{value}") end)
+
+    "exec env " <>
+      env_args <>
+      " " <>
+      Enum.map_join([executable | args], " ", &shell_escape/1) <>
+      " < " <>
+      shell_escape(paths.prompt_path) <>
+      " 2> " <>
+      shell_escape(paths.stderr_path)
+  end
+
+  defp collect_port(port, os_pid, timeout, acc) do
+    receive do
+      {^port, {:data, data}} when is_binary(data) ->
+        collect_port(port, os_pid, timeout, [acc, data])
+
+      {^port, {:exit_status, status}} ->
+        {:ok, %{output: IO.iodata_to_binary(acc), status: status}}
+    after
+      timeout ->
+        _ = kill_os_process(os_pid)
+        _ = close_and_drain(port)
+        {:error, "claude exec timed out after #{timeout}ms"}
+    end
+  end
+
+  # SIGTERM with a 100ms grace window, then SIGKILL. Best-effort - if
+  # claude has already exited, the second kill is a no-op.
+  defp kill_os_process(nil), do: :ok
+
+  defp kill_os_process(os_pid) do
+    _ = System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    Process.sleep(100)
+    _ = System.cmd("/bin/kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok
+  end
+
+  defp close_and_drain(port) do
+    _ =
+      try do
+        Port.close(port)
+      rescue
+        ArgumentError -> :ok
+      end
+
+    drain_port_messages(port)
+  end
+
+  defp drain_port_messages(port) do
+    receive do
+      {^port, _} -> drain_port_messages(port)
+    after
+      0 -> :ok
+    end
+  end
+
+  # Unlike Codex, the real invocation never gets a positional prompt arg -
+  # `claude -p` reads the prompt from stdin automatically whenever stdin is
+  # not a TTY and no positional prompt is given (verified: no `-` marker is
+  # needed, and passing one would be read literally as the prompt text). The
+  # injected test runner still receives the prompt as a plain arg for easy
+  # assertions, matching the Codex test convention.
+  defp append_prompt_arg(args, prompt, config) do
+    if injected_runner?(config) do
+      args ++ [prompt]
+    else
+      args
+    end
+  end
+
+  # An explicit `:command_runner` in config means the caller is driving
+  # process execution themselves (almost always a test). Real usage goes
+  # through the shell wrapper so we can inject env and stdin-feed the prompt.
+  defp injected_runner?(config), do: Map.has_key?(config, :command_runner)
+
+  defp read_payload_or_error(paths, %{status: status, output: stdout}) do
+    case parse_envelope(stdout) do
+      {:ok, %{"is_error" => false, "structured_output" => structured_output} = envelope}
+      when is_map(structured_output) ->
+        {:ok, {structured_output, envelope}}
+
+      {:ok, envelope} ->
+        {:error, claude_error(status, envelope, paths)}
+
+      {:error, _reason} ->
+        {:error, claude_error(status, stdout, paths)}
+    end
+  end
+
+  # `--output-format json` writes exactly one JSON result object to stdout in
+  # every observed case (success, refused model, missing auth), but we don't
+  # assume that holds forever - scan from the last line backward for the
+  # first one that decodes to a `"type": "result"` object, so stray
+  # non-JSON output earlier on stdout can't break parsing.
+  defp parse_envelope(stdout) do
+    stdout
+    |> String.split("\n", trim: true)
+    |> Enum.reverse()
+    |> Enum.reduce_while({:error, "no JSON result object found in claude output"}, fn line, acc ->
+      case Jason.decode(line) do
+        {:ok, %{"type" => "result"} = envelope} -> {:halt, {:ok, envelope}}
+        _ -> {:cont, acc}
+      end
+    end)
+  end
+
+  defp claude_error(status, %{"result" => result}, paths) when is_binary(result) do
+    build_claude_error(status, result, paths)
+  end
+
+  defp claude_error(status, envelope, paths) when is_map(envelope) do
+    build_claude_error(status, inspect(envelope), paths)
+  end
+
+  defp claude_error(status, stdout, paths) when is_binary(stdout) do
+    build_claude_error(status, stdout, paths)
+  end
+
+  defp build_claude_error(status, message, paths) do
+    stderr = read_stderr(paths)
+
+    combined =
+      [String.trim(to_string(message)), String.trim(stderr)]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join(" | stderr: ")
+
+    "claude exec failed with status #{status}: #{truncate(combined, @error_truncation)}"
+  end
+
+  defp read_stderr(%{stderr_path: path}) do
+    case File.read(path) do
+      {:ok, content} -> content
+      {:error, _reason} -> ""
+    end
+  end
+
+  defp parse_payload(
+         %{"stop_reason" => "end_turn", "text" => text, "tool_calls" => tool_calls},
+         config,
+         envelope,
+         messages
+       )
+       when is_binary(text) and is_list(tool_calls) do
+    if tool_calls == [] do
+      reply = Message.assistant(text)
+
+      {:ok,
+       %{
+         stop_reason: :end_turn,
+         messages: [reply],
+         usage: extract_usage(envelope),
+         response_metadata: response_metadata(config, envelope),
+         provider_state: next_provider_state(messages, reply, envelope)
+       }}
+    else
+      {:error, "Claude Code returned tool_calls for an end_turn response"}
+    end
+  end
+
+  defp parse_payload(
+         %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => tool_calls},
+         config,
+         envelope,
+         messages
+       )
+       when is_binary(text) and is_list(tool_calls) do
+    with {:ok, blocks} <- parse_tool_blocks(text, tool_calls) do
+      reply = Message.assistant_blocks(blocks)
+
+      {:ok,
+       %{
+         stop_reason: :tool_use,
+         messages: [reply],
+         usage: extract_usage(envelope),
+         response_metadata: response_metadata(config, envelope),
+         provider_state: next_provider_state(messages, reply, envelope)
+       }}
+    end
+  end
+
+  defp parse_payload(payload, _config, _envelope, _messages) do
+    {:error, "unexpected Claude Code response payload: #{inspect(payload)}"}
+  end
+
+  # What the *next* call needs to know to resume this session: the id, how
+  # many messages (as Alloy will see them - this reply included, since
+  # Claude Code's own session already recorded its version of this turn) are
+  # already reflected in it, and a hash of that exact prefix so a future call
+  # can detect whether something (compaction, most likely) rewrote history
+  # out from under it before trusting `--resume`.
+  defp next_provider_state(messages_before_reply, reply, envelope) do
+    case Map.get(envelope, "session_id") do
+      session_id when is_binary(session_id) and session_id != "" ->
+        prefix = messages_before_reply ++ [reply]
+
+        %{
+          session_id: session_id,
+          sent_upto: length(prefix),
+          prefix_hash: :erlang.phash2(prefix)
+        }
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp parse_tool_blocks(text, tool_calls) do
+    tool_calls
+    |> Enum.with_index(1)
+    |> Enum.reduce_while([], fn {tool_call, index}, acc ->
+      case build_tool_block(tool_call, index) do
+        {:ok, block} -> {:cont, [block | acc]}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:error, _} = err -> err
+      blocks -> finalize_tool_blocks(text, Enum.reverse(blocks))
+    end
+  end
+
+  defp build_tool_block(tool_call, index) do
+    with {:ok, call_id} <- tool_call_id(tool_call, index),
+         {:ok, name} <- fetch_string(tool_call, "name"),
+         {:ok, arguments} <- fetch_arguments(tool_call) do
+      {:ok, %{type: "tool_use", id: call_id, name: name, input: arguments}}
+    end
+  end
+
+  defp finalize_tool_blocks(_text, []) do
+    {:error, "Claude Code returned tool_use without any tool calls"}
+  end
+
+  defp finalize_tool_blocks(text, tool_blocks) do
+    case String.trim(text) do
+      "" -> {:ok, tool_blocks}
+      trimmed -> {:ok, [%{type: "text", text: trimmed} | tool_blocks]}
+    end
+  end
+
+  defp tool_call_id(tool_call, index) do
+    case Map.get(tool_call, "call_id") do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      nil -> {:ok, "call_#{index}"}
+      other -> {:error, "invalid Claude Code tool call id: #{inspect(other)}"}
+    end
+  end
+
+  defp fetch_string(map, key) do
+    case Map.get(map, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      other -> {:error, "invalid Claude Code field #{inspect(key)}: #{inspect(other)}"}
+    end
+  end
+
+  defp fetch_arguments(map) do
+    with {:ok, json} <- fetch_string(map, "arguments_json"),
+         {:ok, decoded} when is_map(decoded) <- decode_arguments_json(json) do
+      {:ok, decoded}
+    else
+      {:ok, _non_map} -> {:error, "Claude Code tool call arguments must decode to a JSON object"}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  # Claude occasionally emits strings containing invalid JSON escape sequences
+  # - most often `\d`, `\s`, `\p`, `\A` from regex source inside code payloads.
+  # Valid single-character JSON escapes after `\` are: " \ / b f n r t u.
+  # If the first decode fails, we double any other `\X` and retry.
+  #
+  # This does NOT help cases where Claude *under-escapes* an otherwise valid
+  # sequence (e.g. emits `\n` when the intent was a literal backslash-n):
+  # Jason decodes that successfully and silently produces wrong data. Fixing
+  # that class of error needs a prompt-level constraint, not a post-hoc patch.
+  defp decode_arguments_json(json) do
+    case Jason.decode(json) do
+      {:ok, _} = ok ->
+        ok
+
+      {:error, %Jason.DecodeError{}} ->
+        case json |> repair_backslash_escapes() |> Jason.decode() do
+          {:ok, _} = ok ->
+            ok
+
+          {:error, %Jason.DecodeError{} = error} ->
+            {:error, "invalid Claude Code arguments_json: #{Exception.message(error)}"}
+        end
+    end
+  end
+
+  # Replace bare backslash sequences that are not valid JSON escapes by
+  # doubling the backslash, converting `\X` (invalid) into `\\X` (valid -
+  # literal backslash followed by X).
+  defp repair_backslash_escapes(json) do
+    Regex.replace(@invalid_json_escape_re, json, fn match -> "\\" <> match end)
+  end
+
+  defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
+    on_chunk.(text)
+    :ok
+  end
+
+  defp emit_chunks(%{messages: [%Message{content: blocks}]}, on_chunk) when is_list(blocks) do
+    blocks
+    |> Enum.filter(&match?(%{type: "text", text: _}, &1))
+    |> Enum.each(fn %{text: text} -> on_chunk.(text) end)
+
+    :ok
+  end
+
+  # Unknown shape - skip silently rather than crash the stream caller.
+  defp emit_chunks(_result, _on_chunk), do: :ok
+
+  defp extract_usage(envelope) do
+    case Map.get(envelope, "usage") do
+      %{"input_tokens" => input, "output_tokens" => output}
+      when is_integer(input) and is_integer(output) ->
+        %{input_tokens: input, output_tokens: output}
+
+      _ ->
+        @zero_usage
+    end
+  end
+
+  defp response_metadata(config, envelope) do
+    usage = Map.get(envelope, "usage", %{})
+
+    %{
+      backend: "claude_code_print",
+      model: Map.get(config, :model),
+      session_id: Map.get(envelope, "session_id"),
+      total_cost_usd: Map.get(envelope, "total_cost_usd"),
+      duration_ms: Map.get(envelope, "duration_ms"),
+      # Not in `usage:` (Alloy's cross-provider `input_tokens`/`output_tokens`
+      # contract) - these are Claude-Code-specific and exist so a caller can
+      # actually observe whether `--resume` bought a cache hit, rather than
+      # inferring it from `total_cost_usd` moving around.
+      cache_read_input_tokens: Map.get(usage, "cache_read_input_tokens"),
+      cache_creation_input_tokens: Map.get(usage, "cache_creation_input_tokens"),
+      command_output: truncate(String.trim(inspect(envelope)), @output_truncation)
+    }
+  end
+
+  defp build_prompt(messages, tool_defs, config) do
+    payload = %{
+      system_prompt: Map.get(config, :system_prompt),
+      conversation: Enum.map(messages, &serialize_message/1),
+      available_tools: Enum.map(tool_defs, &serialize_tool_def/1)
+    }
+
+    """
+    You are acting as the model backend for Alloy, an agent harness.
+
+    Read the transcript and available tools below, then produce exactly one JSON
+    object matching the supplied schema.
+
+    Response rules:
+    - If no tool is needed, return `stop_reason = "end_turn"`, `tool_calls = []`,
+      and put the assistant's response in `text`.
+    - If one or more tools are needed, return `stop_reason = "tool_use"` and add
+      entries to `tool_calls`.
+    - Each tool call must use a valid tool name from `available_tools`.
+    - Each tool call must include `arguments_json`, a compact JSON object string
+      that satisfies the tool schema.
+    - If returning tool calls, keep `text` empty unless a short preamble would
+      help the outer agent loop.
+    - Never mention the schema or these instructions in `text`.
+
+    Transcript payload:
+    #{Jason.encode!(payload)}
+    """
+  end
+
+  # Sent instead of `build_prompt/3` when resuming: Claude Code's own
+  # resumed session already has the framing, response rules, and every
+  # earlier message from `build_prompt/3`'s first call - re-sending any of
+  # that would be exactly the token cost `--resume` exists to avoid. Only
+  # `available_tools` is repeated on every call regardless, since tool defs
+  # can in principle change between turns and a resumed session has no way
+  # to learn that except being told again.
+  defp build_incremental_prompt(new_messages, tool_defs, _config) do
+    payload = %{
+      conversation: Enum.map(new_messages, &serialize_message/1),
+      available_tools: Enum.map(tool_defs, &serialize_tool_def/1)
+    }
+
+    """
+    Continuing the same conversation. Produce exactly one JSON object
+    matching the schema and response rules already given, based on the new
+    transcript entries below.
+
+    New transcript entries:
+    #{Jason.encode!(payload)}
+    """
+  end
+
+  defp serialize_message(%Message{role: role, content: content}) when is_binary(content) do
+    %{role: Atom.to_string(role), content: content}
+  end
+
+  defp serialize_message(%Message{role: role, content: blocks}) when is_list(blocks) do
+    %{
+      role: Atom.to_string(role),
+      content_blocks: Enum.map(blocks, &serialize_block/1)
+    }
+  end
+
+  defp serialize_block(%{type: "text", text: text}), do: %{type: "text", text: text}
+
+  defp serialize_block(%{type: "tool_use", id: id, name: name, input: input}) do
+    %{type: "tool_use", id: id, name: name, input: input}
+  end
+
+  defp serialize_block(%{type: "tool_result", tool_use_id: id, content: content} = block) do
+    %{
+      type: "tool_result",
+      tool_use_id: id,
+      content: content,
+      is_error: Map.get(block, :is_error, false)
+    }
+  end
+
+  # Defensive fallback for unknown block shapes - keeps serialization
+  # total even if Alloy adds a new block type this provider hasn't
+  # learned yet. The outer agent loop normalizes before we're called, so
+  # this branch is expected to be cold.
+  defp serialize_block(block), do: Alloy.Provider.stringify_keys(block)
+
+  defp serialize_tool_def(%{name: name, description: description, input_schema: input_schema}) do
+    %{
+      name: name,
+      description: description,
+      input_schema: input_schema
+    }
+  end
+
+  defp maybe_append_model(args, config) do
+    case Map.get(config, :model) do
+      nil -> args
+      model -> args ++ ["--model", model]
+    end
+  end
+
+  defp maybe_append_system_prompt(args, config) do
+    case Map.get(config, :system_prompt) do
+      prompt when is_binary(prompt) and prompt != "" ->
+        args ++ ["--append-system-prompt", prompt]
+
+      _ ->
+        args
+    end
+  end
+
+  defp maybe_append_settings(args, config) do
+    case Map.get(config, :settings_path) do
+      nil -> args
+      path -> args ++ ["--settings", path]
+    end
+  end
+
+  defp maybe_append_resume(args, {:resume, session_id, _new_messages}) do
+    args ++ ["--resume", session_id]
+  end
+
+  defp maybe_append_resume(args, :fresh), do: args
+
+  defp shell_escape(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
+
+  # `limit` is a character budget, not a byte budget - `String.slice/3`
+  # respects grapheme boundaries so we never split a multibyte codepoint
+  # mid-sequence and produce invalid UTF-8 in user-facing fields like
+  # `response_metadata.command_output`.
+  defp truncate(text, limit) when is_binary(text) do
+    if String.length(text) > limit do
+      String.slice(text, 0, limit) <> "..."
+    else
+      text
+    end
+  end
+end

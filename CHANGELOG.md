@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`Alloy.Provider.ClaudeCode`**: a new provider that uses the local `claude`
+  CLI in headless print mode (`claude -p --output-format json --json-schema
+  ...`) as a structured completion backend, mirroring `Alloy.Provider.Codex`.
+  Every invocation runs with `--tools ""`, `--strict-mcp-config`, and
+  `--safe-mode` so Claude Code cannot execute its own tools, pick up ambient
+  `CLAUDE.md`/skills/plugins/hooks, or reach MCP servers - Alloy keeps sole
+  ownership of the tool loop. Unlike Codex, real usage numbers
+  (`usage.input_tokens` / `usage.output_tokens`) come back from the CLI
+  instead of being hardcoded to zero, so `max_budget_cents` guards work
+  against this provider.
+
 ## [0.12.4] - 2026-07-03
 
 ### Fixed
