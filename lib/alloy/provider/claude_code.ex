@@ -157,8 +157,6 @@ defmodule Alloy.Provider.ClaudeCode do
 
   # Matches any `\X` where X is NOT a valid JSON single-character escape
   # (valid set: " \ / b f n r t u). Used by the decode repair pass.
-  @invalid_json_escape_re ~r{\\(?!["\\/bfnrtu])}
-
   @response_schema %{
     type: "object",
     additionalProperties: false,
@@ -672,32 +670,30 @@ defmodule Alloy.Provider.ClaudeCode do
     end
   end
 
-  # The arguments as an object, which is what the schema now asks for.
+  # The arguments themselves.
   #
-  # It used to ask for `arguments_json`: a *string* containing JSON, so every
-  # tool call was encoded twice and the model had to escape its own payload for
-  # a second pass. That is fine for a browser selector and unworkable for source
-  # code, where quotes, newlines and regex backslashes all have to survive being
-  # escaped, embedded, and parsed back out.
+  # The schema used to ask for `arguments_json`: a *string* containing JSON, so
+  # every tool call was encoded twice and the model had to escape its own
+  # payload for a second pass. Fine for a browser selector, unworkable for
+  # source code, where quotes, newlines and regex backslashes all have to
+  # survive being escaped, embedded, and parsed back out.
   #
-  # It did not survive. Measured 2026-09-08 on Broken Oaths: a coding agent
-  # produced three messages in fifteen minutes and all three were
-  # `invalid Claude Code arguments_json` — every attempt to act rejected before
-  # it happened, no files changed, 4 tool calls against 1,847 messages across
-  # the whole fleet. A QA agent on the same model passing short browser
-  # arguments was mostly fine, which is what made it look like an agent problem.
+  # It did not survive. Measured 2026-09-08: a coding agent produced three
+  # messages in fifteen minutes and all three were `invalid Claude Code
+  # arguments_json` — every attempt to act rejected before it happened, no files
+  # written, 4 tool calls against 1,847 messages across three agents in six
+  # hours. A QA agent on the same model passing short browser arguments was
+  # mostly fine, which is what made it look like a problem with one agent.
   #
-  # `repair_backslash_escapes/1` was the previous answer and its own comment
-  # concedes the limit: it "does NOT help cases where Claude *under-escapes* an
-  # otherwise valid sequence... Fixing that class of error needs a prompt-level
-  # constraint, not a post-hoc patch." A schema is that constraint. Verified
-  # against the real CLI: asking for `arguments` as an object returns
+  # `repair_backslash_escapes/1` was the previous answer and conceded its own
+  # limit: it "does NOT help cases where Claude *under-escapes* an otherwise
+  # valid sequence... Fixing that class of error needs a prompt-level
+  # constraint, not a post-hoc patch." A schema is that constraint, so the
+  # repair pass and the second decode are gone with it.
+  #
+  # Verified against the real CLI: asking for `arguments` as an object returns
   # `{"path":"lib/a.ex","content":"defmodule A do\n  @re ~r/\\d+/\nend"}` —
-  # one encoding, correctly escaped, no repair pass reached.
-  #
-  # The string shape is still accepted. A provider that emits it is answering an
-  # older schema rather than doing something wrong, and rejecting it would turn
-  # a compatible response into a failed turn.
+  # one encoding, correctly escaped.
   defp fetch_arguments(%{"arguments" => arguments}) when is_map(arguments) do
     {:ok, arguments}
   end
@@ -706,51 +702,8 @@ defmodule Alloy.Provider.ClaudeCode do
     {:error, "Claude Code tool call arguments must be an object, got: #{inspect(other)}"}
   end
 
-  defp fetch_arguments(map) do
-    with {:ok, json} <- fetch_string(map, "arguments_json"),
-         {:ok, decoded} when is_map(decoded) <- decode_arguments_json(json) do
-      {:ok, decoded}
-    else
-      {:ok, _non_map} -> {:error, "Claude Code tool call arguments must decode to a JSON object"}
-      {:error, _reason} = err -> err
-    end
-  end
-
-  # Claude occasionally emits strings containing invalid JSON escape sequences
-  # - most often `\d`, `\s`, `\p`, `\A` from regex source inside code payloads.
-  # Valid single-character JSON escapes after `\` are: " \ / b f n r t u.
-  # If the first decode fails, we double any other `\X` and retry.
-  #
-  # This does NOT help cases where Claude *under-escapes* an otherwise valid
-  # sequence (e.g. emits `\n` when the intent was a literal backslash-n):
-  # Jason decodes that successfully and silently produces wrong data. Fixing
-  # that class of error needs a prompt-level constraint, not a post-hoc patch.
-  defp decode_arguments_json(json) do
-    case Jason.decode(json) do
-      {:ok, _} = ok ->
-        ok
-
-      {:error, %Jason.DecodeError{}} ->
-        case json |> repair_backslash_escapes() |> Jason.decode() do
-          {:ok, _} = ok ->
-            ok
-
-          {:error, %Jason.DecodeError{} = error} ->
-            # With the payload, bounded. A byte offset alone tells the model
-            # nothing it can act on, and this error reaches it as the whole
-            # content of a failed turn.
-            {:error,
-             "invalid Claude Code arguments_json: #{Exception.message(error)} — " <>
-               "payload was: #{String.slice(json, 0, 300)}"}
-        end
-    end
-  end
-
-  # Replace bare backslash sequences that are not valid JSON escapes by
-  # doubling the backslash, converting `\X` (invalid) into `\\X` (valid -
-  # literal backslash followed by X).
-  defp repair_backslash_escapes(json) do
-    Regex.replace(@invalid_json_escape_re, json, fn match -> "\\" <> match end)
+  defp fetch_arguments(_map) do
+    {:error, "Claude Code tool call is missing its arguments object"}
   end
 
   defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
@@ -818,8 +771,9 @@ defmodule Alloy.Provider.ClaudeCode do
     - If one or more tools are needed, return `stop_reason = "tool_use"` and add
       entries to `tool_calls`.
     - Each tool call must use a valid tool name from `available_tools`.
-    - Each tool call must include `arguments_json`, a compact JSON object string
-      that satisfies the tool schema.
+    - Each tool call must include `arguments`, a JSON object satisfying the
+      tool schema. Write the arguments directly — they are not a string, and
+      nothing in them needs escaping for a second pass.
     - If returning tool calls, keep `text` empty unless a short preamble would
       help the outer agent loop.
     - Never mention the schema or these instructions in `text`.
