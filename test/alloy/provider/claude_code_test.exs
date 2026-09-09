@@ -88,40 +88,6 @@ defmodule Alloy.Provider.ClaudeCodeTest do
              ]
     end
 
-    # A provider answering the older schema is answering an older schema, not
-    # doing something wrong. Rejecting it would turn a compatible response into
-    # a failed turn.
-    test "still accepts the older arguments_json string" do
-      tool_defs = [
-        %{name: "get_weather", description: "w", input_schema: %{type: "object"}}
-      ]
-
-      config = %{
-        model: "claude-sonnet-5",
-        command_runner:
-          fake_runner(fn _args, _opts ->
-            structured = %{
-              "stop_reason" => "tool_use",
-              "text" => "",
-              "tool_calls" => [
-                %{
-                  "call_id" => "call_1",
-                  "name" => "get_weather",
-                  "arguments_json" => ~s({"location":"Boston, MA"})
-                }
-              ]
-            }
-
-            {envelope(structured), 0}
-          end)
-      }
-
-      assert {:ok, result} = ClaudeCode.complete([Message.user("weather?")], tool_defs, config)
-
-      assert [%Message{content: [block]}] = result.messages
-      assert block.input == %{"location" => "Boston, MA"}
-    end
-
     test "returns tool_use blocks when Claude Code requests tools" do
       tool_defs = [
         %{
@@ -142,7 +108,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
                 %{
                   "call_id" => "call_1",
                   "name" => "search_examples",
-                  "arguments_json" => ~s({"query":"waiting on vendor","limit":2})
+                  "arguments" => %{"query" => "waiting on vendor", "limit" => 2}
                 }
               ]
             }
@@ -195,7 +161,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
                 %{
                   "call_id" => "call_1",
                   "name" => "get_weather",
-                  "arguments_json" => ~s({"location": "Boston, MA"})
+                  "arguments" => %{"location" => "Boston, MA"}
                 }
               ]
             }
@@ -296,7 +262,10 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert reason =~ "tool_calls"
     end
 
-    test "returns a helpful error when arguments_json is not valid JSON" do
+    # There is one shape now and one failure: arguments that are not an object.
+    # The old test covered a string of invalid JSON, which the schema no longer
+    # permits and nothing decodes.
+    test "returns a helpful error when arguments are not an object" do
       config = %{
         model: "claude-sonnet-5",
         command_runner:
@@ -308,7 +277,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
                 %{
                   "call_id" => "call_1",
                   "name" => "search_examples",
-                  "arguments_json" => "{not json}"
+                  "arguments" => "not an object"
                 }
               ]
             }
@@ -318,7 +287,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       }
 
       assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
-      assert reason =~ "arguments_json"
+      assert reason =~ "must be an object"
     end
 
     test "trusts is_error: false in the envelope even if the process exits non-zero" do
