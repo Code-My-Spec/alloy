@@ -25,6 +25,103 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert result.response_metadata.total_cost_usd == 0.001
     end
 
+    # The shape the schema now asks for: the arguments themselves, not a string
+    # holding them.
+    #
+    # Double-encoding is fine for a browser selector and unworkable for source
+    # code — quotes, newlines and regex backslashes have to survive being
+    # escaped, embedded and parsed back out. Measured 2026-09-08: a coding agent
+    # produced three messages in fifteen minutes and all three were
+    # `invalid Claude Code arguments_json`, no files changed, 4 tool calls
+    # against 1,847 messages across the fleet.
+    #
+    # The payload here is the one that broke it: a module with a regex in it.
+    test "reads tool arguments as an object" do
+      tool_defs = [
+        %{
+          name: "write_project_file",
+          description: "Write a file",
+          input_schema: %{type: "object", properties: %{path: %{type: "string"}}}
+        }
+      ]
+
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            structured = %{
+              "stop_reason" => "tool_use",
+              "text" => "",
+              "tool_calls" => [
+                %{
+                  "call_id" => "call_1",
+                  "name" => "write_project_file",
+                  "arguments" => %{
+                    "path" => "lib/a.ex",
+                    "content" => "defmodule A do\n  @re ~r/\\d+/\nend"
+                  }
+                }
+              ]
+            }
+
+            {envelope(structured), 0}
+          end)
+      }
+
+      assert {:ok, result} =
+               ClaudeCode.complete([Message.user("write it")], tool_defs, config)
+
+      assert result.stop_reason == :tool_use
+
+      assert result.messages == [
+               Message.assistant_blocks([
+                 %{
+                   type: "tool_use",
+                   id: "call_1",
+                   name: "write_project_file",
+                   input: %{
+                     "path" => "lib/a.ex",
+                     "content" => "defmodule A do\n  @re ~r/\\d+/\nend"
+                   }
+                 }
+               ])
+             ]
+    end
+
+    # A provider answering the older schema is answering an older schema, not
+    # doing something wrong. Rejecting it would turn a compatible response into
+    # a failed turn.
+    test "still accepts the older arguments_json string" do
+      tool_defs = [
+        %{name: "get_weather", description: "w", input_schema: %{type: "object"}}
+      ]
+
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            structured = %{
+              "stop_reason" => "tool_use",
+              "text" => "",
+              "tool_calls" => [
+                %{
+                  "call_id" => "call_1",
+                  "name" => "get_weather",
+                  "arguments_json" => ~s({"location":"Boston, MA"})
+                }
+              ]
+            }
+
+            {envelope(structured), 0}
+          end)
+      }
+
+      assert {:ok, result} = ClaudeCode.complete([Message.user("weather?")], tool_defs, config)
+
+      assert [%Message{content: [block]}] = result.messages
+      assert block.input == %{"location" => "Boston, MA"}
+    end
+
     test "returns tool_use blocks when Claude Code requests tools" do
       tool_defs = [
         %{

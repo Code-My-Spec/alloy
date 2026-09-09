@@ -173,9 +173,9 @@ defmodule Alloy.Provider.ClaudeCode do
           properties: %{
             call_id: %{type: "string"},
             name: %{type: "string"},
-            arguments_json: %{type: "string"}
+            arguments: %{type: "object"}
           },
-          required: ["call_id", "name", "arguments_json"]
+          required: ["call_id", "name", "arguments"]
         }
       }
     },
@@ -672,6 +672,40 @@ defmodule Alloy.Provider.ClaudeCode do
     end
   end
 
+  # The arguments as an object, which is what the schema now asks for.
+  #
+  # It used to ask for `arguments_json`: a *string* containing JSON, so every
+  # tool call was encoded twice and the model had to escape its own payload for
+  # a second pass. That is fine for a browser selector and unworkable for source
+  # code, where quotes, newlines and regex backslashes all have to survive being
+  # escaped, embedded, and parsed back out.
+  #
+  # It did not survive. Measured 2026-09-08 on Broken Oaths: a coding agent
+  # produced three messages in fifteen minutes and all three were
+  # `invalid Claude Code arguments_json` — every attempt to act rejected before
+  # it happened, no files changed, 4 tool calls against 1,847 messages across
+  # the whole fleet. A QA agent on the same model passing short browser
+  # arguments was mostly fine, which is what made it look like an agent problem.
+  #
+  # `repair_backslash_escapes/1` was the previous answer and its own comment
+  # concedes the limit: it "does NOT help cases where Claude *under-escapes* an
+  # otherwise valid sequence... Fixing that class of error needs a prompt-level
+  # constraint, not a post-hoc patch." A schema is that constraint. Verified
+  # against the real CLI: asking for `arguments` as an object returns
+  # `{"path":"lib/a.ex","content":"defmodule A do\n  @re ~r/\\d+/\nend"}` —
+  # one encoding, correctly escaped, no repair pass reached.
+  #
+  # The string shape is still accepted. A provider that emits it is answering an
+  # older schema rather than doing something wrong, and rejecting it would turn
+  # a compatible response into a failed turn.
+  defp fetch_arguments(%{"arguments" => arguments}) when is_map(arguments) do
+    {:ok, arguments}
+  end
+
+  defp fetch_arguments(%{"arguments" => other}) do
+    {:error, "Claude Code tool call arguments must be an object, got: #{inspect(other)}"}
+  end
+
   defp fetch_arguments(map) do
     with {:ok, json} <- fetch_string(map, "arguments_json"),
          {:ok, decoded} when is_map(decoded) <- decode_arguments_json(json) do
@@ -702,7 +736,12 @@ defmodule Alloy.Provider.ClaudeCode do
             ok
 
           {:error, %Jason.DecodeError{} = error} ->
-            {:error, "invalid Claude Code arguments_json: #{Exception.message(error)}"}
+            # With the payload, bounded. A byte offset alone tells the model
+            # nothing it can act on, and this error reaches it as the whole
+            # content of a failed turn.
+            {:error,
+             "invalid Claude Code arguments_json: #{Exception.message(error)} — " <>
+               "payload was: #{String.slice(json, 0, 300)}"}
         end
     end
   end
