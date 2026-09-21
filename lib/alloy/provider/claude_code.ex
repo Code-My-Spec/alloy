@@ -722,14 +722,43 @@ defmodule Alloy.Provider.ClaudeCode do
   # Unknown shape - skip silently rather than crash the stream caller.
   defp emit_chunks(_result, _on_chunk), do: :ok
 
+  # Including the cached halves, which are nearly all of it.
+  #
+  # Claude Code bills the request in three parts and reports `input_tokens` as
+  # only the uncached remainder. Measured against the real CLI on 2026-09-21: a
+  # first turn carrying a 3.6KB appended system prompt came back
+  # `input_tokens: 4`, `cache_creation_input_tokens: 19_628`,
+  # `cache_read_input_tokens: 25_914` — four tokens against a real input of
+  # forty-five thousand. A caller adding up `input_tokens` to bill somebody, or
+  # to decide a prompt is too long, is reading a number four orders of
+  # magnitude out.
+  #
+  # `Alloy.Usage` has carried both fields all along; this filled neither, so the
+  # cache hit `--resume` exists to buy was invisible in the one place a caller
+  # looks for it. `response_metadata/2` reports them too and still does — that
+  # is the Claude-Code-specific view, and this is the cross-provider one.
   defp extract_usage(envelope) do
     case Map.get(envelope, "usage") do
       %{"input_tokens" => input, "output_tokens" => output}
       when is_integer(input) and is_integer(output) ->
-        %{input_tokens: input, output_tokens: output}
+        %{
+          input_tokens: input,
+          output_tokens: output,
+          cache_creation_input_tokens: cached(envelope, "cache_creation_input_tokens"),
+          cache_read_input_tokens: cached(envelope, "cache_read_input_tokens")
+        }
 
       _ ->
         @zero_usage
+    end
+  end
+
+  # Absent and zero are the same thing to a total, and a provider that does not
+  # report caching should not look like one whose cache never hit.
+  defp cached(envelope, key) do
+    case envelope |> Map.get("usage", %{}) |> Map.get(key) do
+      n when is_integer(n) -> n
+      _ -> 0
     end
   end
 
