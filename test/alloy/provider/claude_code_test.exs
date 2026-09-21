@@ -18,11 +18,74 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert {:ok, result} = ClaudeCode.complete([Message.user("Hi")], [], config)
       assert result.stop_reason == :end_turn
       assert result.messages == [Message.assistant("All done")]
-      assert result.usage == %{input_tokens: 5, output_tokens: 7}
+
+      assert result.usage == %{
+               input_tokens: 5,
+               output_tokens: 7,
+               cache_creation_input_tokens: 0,
+               cache_read_input_tokens: 0
+             }
+
       assert result.response_metadata.backend == "claude_code_print"
       assert result.response_metadata.model == "claude-sonnet-5"
       assert result.response_metadata.session_id == "sess_test"
       assert result.response_metadata.total_cost_usd == 0.001
+    end
+
+    # Claude Code bills a request in three parts and reports `input_tokens` as
+    # the uncached remainder alone. Measured against the real CLI on 2026-09-21:
+    # a turn carrying a 3.6KB appended system prompt answered `input_tokens: 4`
+    # beside a cache_creation of 19,628 and a cache_read of 25,914 — four tokens
+    # against a real input of forty-five thousand. One agent turn through a
+    # harness reported 26 against an actual 826,876.
+    #
+    # So a caller totalling `input_tokens` to bill somebody, or to judge whether
+    # a prompt is too long, reads a number four orders of magnitude out — and
+    # the cache hit `--resume` exists to buy is invisible in the one place a
+    # caller looks for it.
+    test "usage carries the cached halves, not just the uncached remainder" do
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            {envelope(
+               %{"stop_reason" => "end_turn", "text" => "ok", "tool_calls" => []},
+               usage: %{
+                 "input_tokens" => 4,
+                 "output_tokens" => 11,
+                 "cache_creation_input_tokens" => 19_628,
+                 "cache_read_input_tokens" => 25_914
+               }
+             ), 0}
+          end)
+      }
+
+      assert {:ok, result} = ClaudeCode.complete([Message.user("Hi")], [], config)
+
+      assert result.usage == %{
+               input_tokens: 4,
+               output_tokens: 11,
+               cache_creation_input_tokens: 19_628,
+               cache_read_input_tokens: 25_914
+             }
+    end
+
+    # Absent and zero are the same to a total, and a provider that does not
+    # report caching must not read as one whose cache never hit.
+    test "a response without cache figures reports zeroes rather than nil" do
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            {envelope(%{"stop_reason" => "end_turn", "text" => "ok", "tool_calls" => []},
+               usage: %{"input_tokens" => 5, "output_tokens" => 7}
+             ), 0}
+          end)
+      }
+
+      assert {:ok, result} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert result.usage.cache_read_input_tokens == 0
+      assert result.usage.cache_creation_input_tokens == 0
     end
 
     # The shape the schema now asks for: the arguments themselves, not a string
