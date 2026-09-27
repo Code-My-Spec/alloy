@@ -16,11 +16,11 @@ defmodule Alloy.Provider.Codex do
   - `:codex_bin` - Executable path (default: `"codex"`)
   - `:workdir` - Directory passed to `codex exec` (defaults to a temp dir)
   - `:profile` - Optional Codex config profile
-  - `:codex_home` - Override `CODEX_HOME` instead of creating an isolated temp home
+  - `:codex_home` - Override `CODEX_HOME` instead of using the isolated home
   - `:auth_path` - Override source `auth.json` copied into the isolated home
     (default: `~/.codex/auth.json`)
-  - `:tmp_dir` - Parent for the provider's temp working directory
-    (default: `System.tmp_dir!/0`)
+  - `:tmp_dir` - Parent for the provider's temp working directory and the
+    isolated home (default: `System.tmp_dir!/0`)
   - `:timeout_ms` - Timeout for a single `codex exec` invocation
     (default: `120_000`)
   - `:receive_timeout` - Optional turn deadline timeout injected by Alloy's
@@ -28,20 +28,45 @@ defmodule Alloy.Provider.Codex do
   - `:command_runner` - Test hook matching `System.cmd/3`
   - `:system_prompt` - System prompt string
 
+  ## Session continuation (`exec resume`)
+
+  Codex keeps its own conversation history, so only the first turn sends the
+  whole transcript. Every later turn resumes the thread with `codex exec resume
+  <thread_id>` and sends just the messages Codex has not seen, which is what
+  lets the prefix come back as `cached_input_tokens`. Measured on codex-cli
+  0.157.1: a resumed second turn recalled the first and read 20,864 of 47,350
+  input tokens from cache.
+
+  Resumption uses `Alloy.Provider.CliSession`, the same `:provider_state`
+  prefix-hash check as `Alloy.Provider.ClaudeCode`: a transcript rewritten by
+  compaction goes out fresh with the full history. If a resumed run finishes
+  without producing a response (the thread is gone because the home was
+  cleared), the turn is retried fresh. `exec resume` has no `--profile`, so a
+  `:profile` applies to the turn that started the thread and not to resumed
+  ones.
+
   ## Notes
 
   - Authentication is handled by the local `codex` CLI login state.
-  - By default the provider creates a minimal temporary `CODEX_HOME` containing
-    only `auth.json`, which avoids pulling in the user's full MCP/plugin config.
-  - Usage accounting is not exposed by `codex exec` in a structured form yet,
-    so this provider currently reports zero token counts.
+  - By default the provider uses an isolated `CODEX_HOME` holding only
+    `auth.json` (plus `config.toml` when a `:profile` is set), which avoids
+    pulling in the user's full MCP/plugin config. It lives at
+    `<tmp_dir>/alloy-codex-home` and persists across calls, because that is
+    where Codex records the threads it resumes.
+  - Usage comes from the `turn.completed` event of `--json` output. Codex's
+    `input_tokens` includes the cached part; it is reported here as Alloy
+    counts it, with `input_tokens` the uncached remainder and
+    `cache_read_input_tokens` the cached part.
   - Streaming is emulated by running a normal completion and replaying the final
     text to the provided callback.
   """
 
   @behaviour Alloy.Provider
 
+  require Logger
+
   alias Alloy.Message
+  alias Alloy.Provider.CliSession
 
   @default_timeout_ms 120_000
   @default_codex_bin "codex"
@@ -95,7 +120,8 @@ defmodule Alloy.Provider.Codex do
           optional(:receive_timeout) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:command_runner) => (String.t(), [String.t()], keyword() ->
-                                          {String.t(), integer()})
+                                          {String.t(), integer()}),
+          optional(:provider_state) => map()
         }
 
   @impl true
@@ -105,12 +131,10 @@ defmodule Alloy.Provider.Codex do
     case prepare_paths(config) do
       {:ok, paths} ->
         try do
-          with :ok <- File.write(paths.schema_path, @response_schema_json),
-               prompt = build_prompt(messages, tool_defs, config),
-               :ok <- File.write(paths.prompt_path, prompt),
-               {:ok, command_result} <- run_codex(prompt, paths, config),
-               {:ok, payload} <- read_payload_or_error(paths.last_message_path, command_result) do
-            parse_payload(payload, config, command_result)
+          with :ok <- File.write(paths.schema_path, @response_schema_json) do
+            config
+            |> CliSession.plan(messages)
+            |> run_turn(messages, tool_defs, paths, config)
           end
         after
           cleanup_paths(paths)
@@ -120,6 +144,48 @@ defmodule Alloy.Provider.Codex do
         {:error, reason}
     end
   end
+
+  defp run_turn(plan, messages, tool_defs, paths, config) do
+    prompt = build_turn_prompt(plan, messages, tool_defs, config)
+
+    with :ok <- File.write(paths.prompt_path, prompt),
+         {:ok, command_result} <- run_codex(prompt, paths, config, plan),
+         {:ok, payload} <- read_turn_payload(plan, paths.last_message_path, command_result) do
+      parse_payload(payload, config, command_result, messages)
+    else
+      {:resume_failed, session_id, reason} ->
+        Logger.warning(
+          "Alloy.Provider.Codex could not resume thread #{session_id}, " <>
+            "sending the full transcript instead: #{reason}"
+        )
+
+        _ = File.rm(paths.last_message_path)
+        run_turn(:fresh, messages, tool_defs, paths, config)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  # A resumed run that finished without a response most likely named a thread
+  # this home no longer has. Only a *finished* run: a timeout is `{:error, _}`
+  # from `run_codex/4` and is not retried, since a second full-length attempt
+  # would double the wait for the same outcome.
+  defp read_turn_payload({:resume, session_id, _new}, path, command_result) do
+    case read_payload_or_error(path, command_result) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, reason} -> {:resume_failed, session_id, reason}
+    end
+  end
+
+  defp read_turn_payload(:fresh, path, command_result),
+    do: read_payload_or_error(path, command_result)
+
+  defp build_turn_prompt({:resume, _session_id, new_messages}, _messages, tool_defs, _config),
+    do: build_incremental_prompt(new_messages, tool_defs)
+
+  defp build_turn_prompt(:fresh, messages, tool_defs, config),
+    do: build_prompt(messages, tool_defs, config)
 
   @impl true
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
@@ -182,8 +248,16 @@ defmodule Alloy.Provider.Codex do
     {:ok, codex_home}
   end
 
-  defp prepare_codex_home(base_dir, config) do
-    codex_home = Path.join(base_dir, "codex-home")
+  # Outside `base_dir` and never cleaned up: Codex records its threads under
+  # `CODEX_HOME/sessions`, and a home deleted after every call left nothing for
+  # the next turn to resume.
+  #
+  # A profile needs the user's `config.toml`, and a shared home that once held
+  # it would hand it — MCP servers and all — to every unprofiled call after, so
+  # the two get separate homes.
+  defp prepare_codex_home(_base_dir, config) do
+    parent = Map.get(config, :tmp_dir) || System.tmp_dir!()
+    codex_home = Path.join(parent, codex_home_name(config))
     auth_source = Map.get(config, :auth_path, default_auth_path())
 
     with :ok <- File.mkdir_p(codex_home),
@@ -192,24 +266,28 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp run_codex(prompt, paths, config) do
+  defp codex_home_name(%{profile: profile}) when is_binary(profile) and profile != "",
+    do: "alloy-codex-home-with-config"
+
+  defp codex_home_name(_config), do: "alloy-codex-home"
+
+  defp run_codex(prompt, paths, config, plan) do
     executable = Map.get(config, :codex_bin, @default_codex_bin)
     timeout = effective_timeout(config)
 
     args =
-      [
-        "exec",
-        "--skip-git-repo-check",
-        "--ephemeral",
-        "--sandbox",
-        "read-only",
+      plan
+      |> exec_args()
+      |> Kernel.++([
+        "--json",
         "--output-schema",
         paths.schema_path,
         "--output-last-message",
         paths.last_message_path
-      ]
+      ])
       |> maybe_append_profile(config)
       |> maybe_append_model(config)
+      |> maybe_append_session(plan)
       |> append_prompt_arg(prompt, config)
 
     if injected_runner?(config) do
@@ -393,17 +471,12 @@ defmodule Alloy.Provider.Codex do
   defp parse_payload(
          %{"stop_reason" => "end_turn", "text" => text, "tool_calls" => tool_calls},
          config,
-         command_result
+         command_result,
+         messages
        )
        when is_binary(text) and is_list(tool_calls) do
     if tool_calls == [] do
-      {:ok,
-       %{
-         stop_reason: :end_turn,
-         messages: [Message.assistant(text)],
-         usage: @zero_usage,
-         response_metadata: response_metadata(config, command_result)
-       }}
+      {:ok, completion(:end_turn, Message.assistant(text), config, command_result, messages)}
     else
       {:error, "Codex returned tool_calls for an end_turn response"}
     end
@@ -412,22 +485,82 @@ defmodule Alloy.Provider.Codex do
   defp parse_payload(
          %{"stop_reason" => "tool_use", "text" => text, "tool_calls" => tool_calls},
          config,
-         command_result
+         command_result,
+         messages
        )
        when is_binary(text) and is_list(tool_calls) do
     with {:ok, blocks} <- parse_tool_blocks(text, tool_calls) do
-      {:ok,
-       %{
-         stop_reason: :tool_use,
-         messages: [Message.assistant_blocks(blocks)],
-         usage: @zero_usage,
-         response_metadata: response_metadata(config, command_result)
-       }}
+      reply = Message.assistant_blocks(blocks)
+      {:ok, completion(:tool_use, reply, config, command_result, messages)}
     end
   end
 
-  defp parse_payload(payload, _config, _command_result) do
+  defp parse_payload(payload, _config, _command_result, _messages) do
     {:error, "unexpected Codex response payload: #{inspect(payload)}"}
+  end
+
+  defp completion(stop_reason, reply, config, command_result, messages) do
+    events = json_events(command_result.output)
+
+    %{
+      stop_reason: stop_reason,
+      messages: [reply],
+      usage: extract_usage(events),
+      response_metadata: response_metadata(config, command_result),
+      provider_state: CliSession.next_state(messages, reply, thread_id(events))
+    }
+  end
+
+  # `--json` writes one event per line; stderr is merged into the same stream,
+  # so anything that does not decode to an event is skipped.
+  defp json_events(output) do
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn line ->
+      case Jason.decode(line) do
+        {:ok, %{"type" => type} = event} when is_binary(type) -> [event]
+        _ -> []
+      end
+    end)
+  end
+
+  defp thread_id(events) do
+    Enum.find_value(events, fn
+      %{"type" => "thread.started", "thread_id" => id} when is_binary(id) -> id
+      _ -> nil
+    end)
+  end
+
+  # Codex counts cached tokens inside `input_tokens`; `Alloy.Usage` prices
+  # `input_tokens` at the full rate, so the cached part is split out.
+  defp extract_usage(events) do
+    events
+    |> Enum.reverse()
+    |> Enum.find_value(@zero_usage, fn
+      %{
+        "type" => "turn.completed",
+        "usage" => %{"input_tokens" => input, "output_tokens" => output} = usage
+      }
+      when is_integer(input) and is_integer(output) ->
+        cached = count(usage, "cached_input_tokens")
+
+        %{
+          input_tokens: max(input - cached, 0),
+          output_tokens: output,
+          cache_read_input_tokens: cached,
+          cache_creation_input_tokens: count(usage, "cache_write_input_tokens")
+        }
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp count(usage, key) do
+    case Map.get(usage, key) do
+      n when is_integer(n) -> n
+      _ -> 0
+    end
   end
 
   defp parse_tool_blocks(text, tool_calls) do
@@ -576,6 +709,25 @@ defmodule Alloy.Provider.Codex do
     """
   end
 
+  # Sent instead of `build_prompt/3` when resuming: the thread already holds the
+  # framing, the response rules and every earlier message. Tool definitions are
+  # repeated because they can change between turns.
+  defp build_incremental_prompt(new_messages, tool_defs) do
+    payload = %{
+      conversation: Enum.map(new_messages, &serialize_message/1),
+      available_tools: Enum.map(tool_defs, &serialize_tool_def/1)
+    }
+
+    """
+    Continuing the same conversation. Produce exactly one JSON object
+    matching the schema and response rules already given, based on the new
+    transcript entries below.
+
+    New transcript entries:
+    #{Jason.encode!(payload)}
+    """
+  end
+
   defp serialize_message(%Message{role: role, content: content}) when is_binary(content) do
     %{role: Atom.to_string(role), content: content}
   end
@@ -616,12 +768,27 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
+  # Not `--ephemeral`: that stops Codex recording the thread, and the thread is
+  # what gets resumed. `exec resume` has no `--sandbox`, so it goes in as a
+  # config override.
+  defp exec_args(:fresh), do: ["exec", "--skip-git-repo-check", "--sandbox", "read-only"]
+
+  defp exec_args({:resume, _session_id, _new_messages}),
+    do: ["exec", "resume", "--skip-git-repo-check", "-c", ~s(sandbox_mode="read-only")]
+
+  # Fresh turns only: `exec resume` has no `--profile` (codex-cli 0.157.1).
+  defp maybe_append_profile(["exec", "resume" | _] = args, _config), do: args
+
   defp maybe_append_profile(args, config) do
     case Map.get(config, :profile) do
       nil -> args
       profile -> args ++ ["--profile", profile]
     end
   end
+
+  # The thread id is positional, ahead of the prompt marker.
+  defp maybe_append_session(args, {:resume, session_id, _new_messages}), do: args ++ [session_id]
+  defp maybe_append_session(args, :fresh), do: args
 
   defp maybe_append_model(args, config) do
     case Map.get(config, :model) do
@@ -634,12 +801,18 @@ defmodule Alloy.Provider.Codex do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
+  # Copied then renamed, because the home is shared: a plain `File.cp/2`
+  # truncates the destination first, and a `codex` another agent started a
+  # moment earlier could read a half-written `auth.json`.
   defp copy_file(source, destination) do
-    case File.cp(source, destination) do
-      :ok ->
-        :ok
+    staging = "#{destination}.#{System.unique_integer([:positive])}"
 
+    with :ok <- File.cp(source, staging),
+         :ok <- File.rename(staging, destination) do
+      :ok
+    else
       {:error, reason} ->
+        _ = File.rm(staging)
         {:error, "failed to copy #{Path.basename(source)} into Codex home: #{inspect(reason)}"}
     end
   end
@@ -650,9 +823,9 @@ defmodule Alloy.Provider.Codex do
 
     case File.exists?(config_source) do
       true ->
-        case File.cp(config_source, Path.join(codex_home, "config.toml")) do
+        case copy_file(config_source, Path.join(codex_home, "config.toml")) do
           :ok -> {:ok, codex_home}
-          {:error, reason} -> {:error, "failed to copy Codex config: #{inspect(reason)}"}
+          {:error, reason} -> {:error, reason}
         end
 
       false ->

@@ -394,6 +394,125 @@ defmodule Alloy.Provider.CodexTest do
     end
   end
 
+  describe "session continuation" do
+    @thread "01a0e329-c415-74d3-a094-f28ef64e03cc"
+
+    test "reports usage and the thread to resume from --json events" do
+      config = %{model: "gpt-5.4", command_runner: fake_runner(json_reply("Hi back"))}
+      messages = [Message.user("Hi")]
+
+      assert {:ok, result} = Codex.complete(messages, [], config)
+
+      assert result.usage == %{
+               input_tokens: 26_486,
+               output_tokens: 11,
+               cache_read_input_tokens: 20_864,
+               cache_creation_input_tokens: 0
+             }
+
+      prefix = messages ++ [Message.assistant("Hi back")]
+
+      assert result.provider_state == %{
+               session_id: @thread,
+               sent_upto: 2,
+               prefix_hash: :erlang.phash2(prefix)
+             }
+    end
+
+    test "resumes the thread and sends only the messages it has not seen" do
+      parent = self()
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+      messages = earlier ++ [Message.user("What was it?")]
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{
+          session_id: @thread,
+          sent_upto: 2,
+          prefix_hash: :erlang.phash2(earlier)
+        },
+        command_runner:
+          fake_runner(fn args, opts, path ->
+            send(parent, {:args, args})
+            json_reply("PLUM").(args, opts, path)
+          end)
+      }
+
+      assert {:ok, result} = Codex.complete(messages, [], config)
+      assert_receive {:args, ["exec", "resume" | _] = args}
+
+      prompt = List.last(args)
+      assert Enum.at(args, -2) == @thread
+      assert prompt =~ "What was it?"
+      refute prompt =~ "Remember PLUM"
+      refute "--ephemeral" in args
+      assert result.provider_state.sent_upto == 4
+    end
+
+    test "sends the full transcript when earlier history was rewritten" do
+      parent = self()
+      messages = [Message.user("Compacted summary"), Message.assistant("OK"), Message.user("Go")]
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: @thread, sent_upto: 2, prefix_hash: 0},
+        command_runner:
+          fake_runner(fn args, opts, path ->
+            send(parent, {:args, args})
+            json_reply("Going").(args, opts, path)
+          end)
+      }
+
+      assert {:ok, _result} = Codex.complete(messages, [], config)
+      assert_receive {:args, ["exec", "--skip-git-repo-check" | _] = args}
+      assert List.last(args) =~ "Compacted summary"
+    end
+
+    test "falls back to the full transcript when the thread cannot be resumed" do
+      parent = self()
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+      messages = earlier ++ [Message.user("What was it?")]
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: @thread, sent_upto: 2, prefix_hash: :erlang.phash2(earlier)},
+        command_runner:
+          fake_runner(fn args, opts, path ->
+            send(parent, {:args, args})
+
+            case args do
+              ["exec", "resume" | _] -> {"Error: thread not found", 1}
+              _ -> json_reply("PLUM").(args, opts, path)
+            end
+          end)
+      }
+
+      {result, log} =
+        ExUnit.CaptureLog.with_log(fn -> Codex.complete(messages, [], config) end)
+
+      assert {:ok, %{messages: [%Message{content: "PLUM"}]}} = result
+      assert log =~ "could not resume thread #{@thread}"
+      assert_receive {:args, ["exec", "resume" | _]}
+      assert_receive {:args, ["exec", "--skip-git-repo-check" | _] = fresh}
+      assert List.last(fresh) =~ "Remember PLUM"
+    end
+
+    defp json_reply(text) do
+      fn _args, _opts, output_path ->
+        File.write!(
+          output_path,
+          Jason.encode!(%{stop_reason: "end_turn", text: text, tool_calls: []})
+        )
+
+        """
+        {"type":"thread.started","thread_id":"#{@thread}"}
+        {"type":"turn.started"}
+        {"type":"turn.completed","usage":{"input_tokens":47350,"cached_input_tokens":20864,"cache_write_input_tokens":0,"output_tokens":11}}
+        """
+      end
+    end
+  end
+
   describe "stream/4" do
     test "replays the final assistant text through the callback" do
       parent = self()
