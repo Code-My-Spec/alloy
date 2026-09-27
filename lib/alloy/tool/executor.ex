@@ -29,6 +29,7 @@ defmodule Alloy.Tool.Executor do
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
     context = build_context(state)
     tool_timeout = state.config.tool_timeout
+    unknown_tool = state.config.unknown_tool
     on_event = Keyword.get(opts, :on_event, fn _ -> :ok end)
     seq_ref = Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false))
     corr_id = Keyword.get(opts, :event_correlation_id, random_id())
@@ -44,7 +45,7 @@ defmodule Alloy.Tool.Executor do
         # Phase 1: Non-concurrent tools run sequentially
         seq_results =
           Enum.map(sequential, fn tag ->
-            run_tagged(tag, tool_fns, context, on_event, seq_ref, corr_id, turn)
+            run_tagged(tag, tool_fns, context, unknown_tool, on_event, seq_ref, corr_id, turn)
           end)
 
         # Phase 2: Concurrent tools run in parallel
@@ -55,7 +56,7 @@ defmodule Alloy.Tool.Executor do
             Task.Supervisor.async_stream(
               Alloy.TaskSupervisor,
               concurrent,
-              &run_tagged(&1, tool_fns, context, on_event, seq_ref, corr_id, turn),
+              &run_tagged(&1, tool_fns, context, unknown_tool, on_event, seq_ref, corr_id, turn),
               timeout: tool_timeout,
               ordered: true,
               on_timeout: :kill_task
@@ -95,7 +96,7 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  defp run_tagged({:execute, call}, fns, ctx, on_event, seq_ref, corr_id, turn) do
+  defp run_tagged({:execute, call}, fns, ctx, unknown_tool, on_event, seq_ref, corr_id, turn) do
     t0 = System.monotonic_time(:millisecond)
     sseq = emit_start(on_event, call, seq_ref, corr_id, turn)
     block_fn = result_block_fn(call[:type])
@@ -128,7 +129,7 @@ defmodule Alloy.Tool.Executor do
           end
 
         :error ->
-          err = "Unknown tool: #{call[:name]}"
+          err = unknown_tool_message(unknown_tool, call[:name])
           {block_fn.(call[:id], err, true), err, nil}
       end
 
@@ -153,7 +154,7 @@ defmodule Alloy.Tool.Executor do
     {result, meta}
   end
 
-  defp run_tagged({:blocked, call, reason}, _, _, on_event, seq_ref, corr_id, turn) do
+  defp run_tagged({:blocked, call, reason}, _, _, _, on_event, seq_ref, corr_id, turn) do
     sseq = emit_start(on_event, call, seq_ref, corr_id, turn)
     error = "Blocked: #{reason}"
 
@@ -340,6 +341,12 @@ defmodule Alloy.Tool.Executor do
     par_map = Map.new(Enum.zip(par_tags, par_results))
     Enum.map(tagged, fn tag -> Map.get(seq_map, tag) || Map.get(par_map, tag) end)
   end
+
+  # What the model is told when it calls a tool it was not given. The host may
+  # know better than "unknown": a tool reachable some other way reads, under the
+  # default, exactly like one that does not exist.
+  defp unknown_tool_message(nil, name), do: "Unknown tool: #{name}"
+  defp unknown_tool_message(fun, name) when is_function(fun, 1), do: fun.(name)
 
   defp build_context(%State{} = state) do
     Map.merge(state.config.context, %{
