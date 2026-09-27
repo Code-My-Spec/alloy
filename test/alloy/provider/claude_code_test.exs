@@ -780,6 +780,126 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert_receive {:chunk, "Chunk me"}
       assert result.messages == [Message.assistant("Chunk me")]
     end
+
+    test "streams the reply text out of the StructuredOutput deltas as they arrive" do
+      parent = self()
+      final = "Plums are \"stone\" fruits.\nPrunes 🍑 are dried plums."
+
+      # The shape `stream-json --include-partial-messages` delivers under
+      # `--json-schema`: a thinking block, then the tool input in fragments cut
+      # mid-escape, mid-`\u`, and between a surrogate pair's halves.
+      fragments = [
+        ~s({"stop_reason": "end_tur),
+        ~s(n", "text": "Plums are \\"sto),
+        ~s(ne\\" fruits.\\),
+        ~s(nPrunes \\ud83),
+        ~s(c\\udf),
+        ~s(51 are dried plums.", "tool_calls": []})
+      ]
+
+      stdout =
+        [
+          stream_event(%{
+            "type" => "content_block_start",
+            "content_block" => %{"type" => "thinking"}
+          }),
+          stream_event(%{
+            "type" => "content_block_delta",
+            "delta" => %{"type" => "thinking_delta", "thinking" => "The user wants plums."}
+          }),
+          stream_event(%{
+            "type" => "content_block_start",
+            "content_block" => %{"type" => "tool_use"}
+          })
+          | Enum.map(fragments, fn fragment ->
+              stream_event(%{
+                "type" => "content_block_delta",
+                "delta" => %{"type" => "input_json_delta", "partial_json" => fragment}
+              })
+            end)
+        ] ++
+          [envelope(%{"stop_reason" => "end_turn", "text" => final, "tool_calls" => []})]
+
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn args, _opts ->
+            send(parent, {:args, args})
+            Enum.join(stdout, "\n") <> "\n"
+          end)
+      }
+
+      assert {:ok, result} =
+               ClaudeCode.stream([Message.user("Plums?")], [], config, fn chunk ->
+                 send(parent, {:chunk, chunk})
+                 :ok
+               end)
+
+      assert_receive {:args, args}
+
+      assert ["--output-format", "stream-json", "--verbose", "--include-partial-messages" | _] =
+               Enum.drop_while(args, &(&1 != "--output-format"))
+
+      chunks = collect_chunks([])
+      assert length(chunks) > 1
+      assert Enum.join(chunks) == final
+      assert result.messages == [Message.assistant(final)]
+    end
+
+    test "complete/3 keeps the single json result" do
+      parent = self()
+
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn args, _opts ->
+            send(parent, {:args, args})
+            envelope(%{"stop_reason" => "end_turn", "text" => "ok", "tool_calls" => []})
+          end)
+      }
+
+      assert {:ok, _result} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert_receive {:args, args}
+      assert ["--output-format", "json" | _] = Enum.drop_while(args, &(&1 != "--output-format"))
+    end
+  end
+
+  describe "TextStream.text_prefix/1" do
+    alias Alloy.Provider.ClaudeCode.TextStream
+
+    test "is nil until the text value starts" do
+      assert TextStream.text_prefix(~s({"stop_reason": "tool_use", "te)) == nil
+      assert TextStream.text_prefix(~s({"stop_reason": "tool_use", "text": )) == nil
+    end
+
+    test "ignores a text key nested in tool call arguments" do
+      json =
+        ~s({"stop_reason": "tool_use", "tool_calls": [{"name": "write", "arguments": {"text": "no"}}], "text": "yes)
+
+      assert TextStream.text_prefix(json) == "yes"
+    end
+
+    test "does not take a value that happens to be the string text for the key" do
+      assert TextStream.text_prefix(~s({"stop_reason": "text", "text": "real)) == "real"
+    end
+
+    test "holds back an escape that has not finished arriving" do
+      assert TextStream.text_prefix(~s({"text": "a\\)) == "a"
+      assert TextStream.text_prefix(~s({"text": "a\\u00)) == "a"
+      assert TextStream.text_prefix(~s({"text": "a\\u00e9)) == "aé"
+      assert TextStream.text_prefix(~s({"text": "a\\ud83c)) == "a"
+      assert TextStream.text_prefix(~s({"text": "a\\ud83c\\udf51)) == "a🍑"
+    end
+  end
+
+  defp stream_event(event), do: Jason.encode!(%{"type" => "stream_event", "event" => event})
+
+  defp collect_chunks(acc) do
+    receive do
+      {:chunk, chunk} -> collect_chunks([chunk | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
   end
 
   defp fake_runner(fun) do
