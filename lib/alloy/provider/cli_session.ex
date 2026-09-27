@@ -43,5 +43,13 @@ defmodule Alloy.Provider.CliSession do
     %{session_id: session_id, sent_upto: length(prefix), prefix_hash: :erlang.phash2(prefix)}
   end
 
-  def next_state(_messages, _reply, _session_id), do: %{}
+  # Not `%{}`: `Alloy.Agent.Turn` merges provider state, so an empty map keeps
+  # the previous session, and the next turn would resume it one turn short.
+  def next_state(_messages, _reply, _session_id), do: reset()
+
+  @doc false
+  # Provider state that makes the next turn go out fresh. Explicit nils rather
+  # than an empty map, for the merge reason above.
+  @spec reset() :: map()
+  def reset, do: %{session_id: nil, sent_upto: nil, prefix_hash: nil}
 end

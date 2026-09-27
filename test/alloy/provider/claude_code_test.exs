@@ -859,7 +859,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
           }),
           stream_event(%{
             "type" => "content_block_start",
-            "content_block" => %{"type" => "tool_use"}
+            "content_block" => %{"type" => "tool_use", "name" => "StructuredOutput"}
           })
           | Enum.map(fragments, fn fragment ->
               stream_event(%{
@@ -896,7 +896,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert result.messages == [Message.assistant(final)]
     end
 
-    test "complete/3 keeps the single json result" do
+    test "complete/3 reads stream-json too, so it can see what the model does mid-turn" do
       parent = self()
 
       config = %{
@@ -908,37 +908,189 @@ defmodule Alloy.Provider.ClaudeCodeTest do
           end)
       }
 
-      assert {:ok, _result} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert {:ok, result} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert result.messages == [Message.assistant("ok")]
       assert_receive {:args, args}
-      assert ["--output-format", "json" | _] = Enum.drop_while(args, &(&1 != "--output-format"))
+
+      assert ["--output-format", "stream-json" | _] =
+               Enum.drop_while(args, &(&1 != "--output-format"))
     end
   end
 
-  describe "TextStream.text_prefix/1" do
-    alias Alloy.Provider.ClaudeCode.TextStream
+  describe "a tool the model calls natively" do
+    @read_tool %{
+      name: "read",
+      description: "Read a file",
+      input_schema: %{type: "object", properties: %{file_path: %{type: "string"}}}
+    }
+
+    # The shape from a real session (metric_flow coder 965c52a9): the CLI's
+    # loop answers a native call with a refusal the model then acts on.
+    defp native_call_output(name, input) do
+      [
+        assistant_event([
+          %{"type" => "tool_use", "id" => "toolu_native", "name" => name, "input" => input}
+        ]),
+        Jason.encode!(%{
+          "type" => "user",
+          "message" => %{
+            "content" => [
+              %{
+                "type" => "tool_result",
+                "tool_use_id" => "toolu_native",
+                "content" =>
+                  "<tool_use_error>Error: No such tool available: #{name}</tool_use_error>"
+              }
+            ]
+          }
+        }),
+        envelope(%{
+          "stop_reason" => "end_turn",
+          "text" => "Every tool call fails; this looks like a total tool-execution outage.",
+          "tool_calls" => []
+        })
+      ]
+      |> Enum.join("\n")
+    end
+
+    defp assistant_event(blocks),
+      do: Jason.encode!(%{"type" => "assistant", "message" => %{"content" => blocks}})
+
+    test "one Alloy has is run as a tool call, never refused, and the session is not resumed" do
+      earlier = [Message.user("earlier"), Message.assistant("ok")]
+
+      config = %{
+        model: "claude-sonnet-5",
+        provider_state: %{
+          session_id: "sess_old",
+          sent_upto: 2,
+          prefix_hash: :erlang.phash2(earlier)
+        },
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            native_call_output("read", %{"file_path" => "lib/a.ex"})
+          end)
+      }
+
+      assert {:ok, result} =
+               ClaudeCode.complete(earlier ++ [Message.user("go")], [@read_tool], config)
+
+      assert result.stop_reason == :tool_use
+
+      assert result.messages == [
+               Message.assistant_blocks([
+                 %{
+                   type: "tool_use",
+                   id: "toolu_native",
+                   name: "read",
+                   input: %{"file_path" => "lib/a.ex"}
+                 }
+               ])
+             ]
+
+      refute inspect(result.messages) =~ "outage"
+      assert result.provider_state == %{session_id: nil, sent_upto: nil, prefix_hash: nil}
+    end
+
+    test "one Alloy does not have leaves the reply alone but does not resume the session" do
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner: fake_runner(fn _args, _opts -> native_call_output("health", %{}) end)
+      }
+
+      assert {:ok, result} = ClaudeCode.complete([Message.user("go")], [@read_tool], config)
+      assert result.stop_reason == :end_turn
+      assert result.provider_state == %{session_id: nil, sent_upto: nil, prefix_hash: nil}
+    end
+
+    test "its input is not streamed as the reply" do
+      parent = self()
+
+      stdout =
+        [
+          stream_event(%{
+            "type" => "content_block_start",
+            "content_block" => %{"type" => "tool_use", "name" => "run_script"}
+          }),
+          stream_event(%{
+            "type" => "content_block_delta",
+            "delta" => %{
+              "type" => "input_json_delta",
+              "partial_json" => ~s({"text": "not the reply"})
+            }
+          }),
+          envelope(%{"stop_reason" => "end_turn", "text" => "the reply", "tool_calls" => []})
+        ]
+        |> Enum.join("\n")
+
+      config = %{model: "claude-sonnet-5", command_runner: fake_runner(fn _, _ -> stdout end)}
+
+      assert {:ok, _} =
+               ClaudeCode.stream([Message.user("go")], [], config, &send(parent, {:chunk, &1}))
+
+      assert collect_chunks([]) == ["the reply"]
+    end
+
+    test "the real CLI is stopped before it can refuse, rather than left to finish" do
+      temp_dir =
+        Path.join(System.tmp_dir!(), "alloy-cc-native-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(temp_dir)
+      on_exit(fn -> File.rm_rf(temp_dir) end)
+
+      line =
+        assistant_event([
+          %{"type" => "tool_use", "id" => "toolu_1", "name" => "read", "input" => %{}}
+        ])
+
+      script = Path.join(temp_dir, "fake-claude.sh")
+
+      # Writes the native call, then would sit for a minute before refusing —
+      # a run that is not stopped makes this test time out.
+      File.write!(script, """
+      #!/bin/sh
+      cat > /dev/null
+      printf '%s\\n' '#{line}'
+      sleep 60
+      """)
+
+      File.chmod!(script, 0o755)
+
+      config = %{model: "claude-sonnet-5", claude_bin: script, timeout_ms: 30_000}
+
+      {elapsed_us, result} =
+        :timer.tc(fn -> ClaudeCode.complete([Message.user("go")], [@read_tool], config) end)
+
+      assert {:ok, %{stop_reason: :tool_use}} = result
+      assert elapsed_us < 10_000_000
+    end
+  end
+
+  describe "StreamJson.text_prefix/1" do
+    alias Alloy.Provider.ClaudeCode.StreamJson
 
     test "is nil until the text value starts" do
-      assert TextStream.text_prefix(~s({"stop_reason": "tool_use", "te)) == nil
-      assert TextStream.text_prefix(~s({"stop_reason": "tool_use", "text": )) == nil
+      assert StreamJson.text_prefix(~s({"stop_reason": "tool_use", "te)) == nil
+      assert StreamJson.text_prefix(~s({"stop_reason": "tool_use", "text": )) == nil
     end
 
     test "ignores a text key nested in tool call arguments" do
       json =
         ~s({"stop_reason": "tool_use", "tool_calls": [{"name": "write", "arguments": {"text": "no"}}], "text": "yes)
 
-      assert TextStream.text_prefix(json) == "yes"
+      assert StreamJson.text_prefix(json) == "yes"
     end
 
     test "does not take a value that happens to be the string text for the key" do
-      assert TextStream.text_prefix(~s({"stop_reason": "text", "text": "real)) == "real"
+      assert StreamJson.text_prefix(~s({"stop_reason": "text", "text": "real)) == "real"
     end
 
     test "holds back an escape that has not finished arriving" do
-      assert TextStream.text_prefix(~s({"text": "a\\)) == "a"
-      assert TextStream.text_prefix(~s({"text": "a\\u00)) == "a"
-      assert TextStream.text_prefix(~s({"text": "a\\u00e9)) == "aé"
-      assert TextStream.text_prefix(~s({"text": "a\\ud83c)) == "a"
-      assert TextStream.text_prefix(~s({"text": "a\\ud83c\\udf51)) == "a🍑"
+      assert StreamJson.text_prefix(~s({"text": "a\\)) == "a"
+      assert StreamJson.text_prefix(~s({"text": "a\\u00)) == "a"
+      assert StreamJson.text_prefix(~s({"text": "a\\u00e9)) == "aé"
+      assert StreamJson.text_prefix(~s({"text": "a\\ud83c)) == "a"
+      assert StreamJson.text_prefix(~s({"text": "a\\ud83c\\udf51)) == "a🍑"
     end
   end
 
