@@ -587,7 +587,7 @@ defmodule Alloy.Provider.ClaudeCode do
        )
        when is_binary(text) and is_list(tool_calls) do
     if tool_calls == [] do
-      reply = Message.assistant(text)
+      reply = Message.assistant(unescape_overencoded(text))
 
       {:ok,
        %{
@@ -655,9 +655,30 @@ defmodule Alloy.Provider.ClaudeCode do
   end
 
   defp finalize_tool_blocks(text, tool_blocks) do
-    case String.trim(text) do
+    case text |> unescape_overencoded() |> String.trim() do
       "" -> {:ok, tool_blocks}
       trimmed -> {:ok, [%{type: "text", text: trimmed} | tool_blocks]}
+    end
+  end
+
+  # The model writes `text` as a JSON string value, and now and then escapes it
+  # twice: the value arrives holding a literal `\n` where it meant a line
+  # break, and `\"` where it meant a quote. Measured 2026-09-27: 5 of 14,824
+  # replies in a week, three of them in one conversation, every one rendered
+  # to the user as a single line of `\n\n- `. The Claude Code transcript shows
+  # the escaping in the model's own StructuredOutput call, so nothing here
+  # added it.
+  #
+  # A reply with no line break that decodes cleanly as the body of a JSON
+  # string is taken as one encoded twice. One with a real line break, or with
+  # an unescaped quote, is not, and is left as written.
+  defp unescape_overencoded(text) do
+    with false <- String.contains?(text, "\n"),
+         true <- String.contains?(text, "\\n"),
+         {:ok, decoded} when is_binary(decoded) <- Jason.decode(~s("#{text}")) do
+      decoded
+    else
+      _ -> text
     end
   end
 

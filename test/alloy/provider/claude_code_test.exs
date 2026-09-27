@@ -32,6 +32,56 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert result.response_metadata.total_cost_usd == 0.001
     end
 
+    # Taken from a real reply: the model's StructuredOutput call held the
+    # literal two characters `\n` and rendered as one line.
+    test "a reply the model escaped twice arrives with its line breaks" do
+      text = ~S|Reviewed the check-in.\n\n- QA is waiting on (\"Subscription Sync\").|
+
+      assert {:ok, result} = complete_end_turn(text)
+
+      assert result.messages ==
+               [
+                 Message.assistant(
+                   ~s|Reviewed the check-in.\n\n- QA is waiting on ("Subscription Sync").|
+                 )
+               ]
+    end
+
+    test "text beside a tool call is unescaped the same way" do
+      text = ~S|Checking.\nOne moment.|
+
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            {envelope(%{
+               "stop_reason" => "tool_use",
+               "text" => text,
+               "tool_calls" => [%{"call_id" => "c1", "name" => "read", "arguments" => %{}}]
+             }), 0}
+          end)
+      }
+
+      assert {:ok, %{messages: [%Message{content: [%{type: "text", text: unescaped} | _]}]}} =
+               ClaudeCode.complete([Message.user("Hi")], [], config)
+
+      assert unescaped == "Checking.\nOne moment."
+    end
+
+    test "a reply with real line breaks keeps a literal \\n it quotes" do
+      text = "Use `\\n` in the regex.\nThat is all."
+
+      assert {:ok, result} = complete_end_turn(text)
+      assert result.messages == [Message.assistant(text)]
+    end
+
+    test "a one-line reply with a bare quote is left as written" do
+      text = ~S|Split on "\n" here.|
+
+      assert {:ok, result} = complete_end_turn(text)
+      assert result.messages == [Message.assistant(text)]
+    end
+
     # Claude Code bills a request in three parts and reports `input_tokens` as
     # the uncached remainder alone. Measured against the real CLI on 2026-09-21:
     # a turn carrying a 3.6KB appended system prompt answered `input_tokens: 4`
@@ -900,6 +950,18 @@ defmodule Alloy.Provider.ClaudeCodeTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  defp complete_end_turn(text) do
+    config = %{
+      model: "claude-sonnet-5",
+      command_runner:
+        fake_runner(fn _args, _opts ->
+          {envelope(%{"stop_reason" => "end_turn", "text" => text, "tool_calls" => []}), 0}
+        end)
+    }
+
+    ClaudeCode.complete([Message.user("Hi")], [], config)
   end
 
   defp fake_runner(fun) do
