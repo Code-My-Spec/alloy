@@ -144,14 +144,14 @@ defmodule Alloy.Provider.ClaudeCode do
     --include-partial-messages` and passes the reply's `text` to the callback
     as it arrives. Under `--json-schema` the reply streams as fragments of the
     StructuredOutput tool's JSON input rather than as text, so
-    `Alloy.Provider.ClaudeCode.TextStream` decodes the growing `text` value out
+    `Alloy.Provider.ClaudeCode.StreamJson` decodes the growing `text` value out
     of it. The chunks always add up to the final `text`.
   """
 
   @behaviour Alloy.Provider
 
   alias Alloy.Message
-  alias Alloy.Provider.ClaudeCode.TextStream
+  alias Alloy.Provider.ClaudeCode.StreamJson
   alias Alloy.Provider.CliSession
 
   @default_timeout_ms 120_000
@@ -225,11 +225,9 @@ defmodule Alloy.Provider.ClaudeCode do
           prompt = build_turn_prompt(resume, messages, tool_defs, config)
 
           with :ok <- File.write(paths.prompt_path, prompt),
-               {:ok, command_result} <- run_claude(prompt, paths, config, resume, on_chunk),
-               {:ok, {structured_output, envelope}} <-
-                 read_payload_or_error(paths, command_result) do
-            finish_stream(command_result, structured_output)
-            parse_payload(structured_output, config, envelope, messages)
+               {:ok, command_result} <-
+                 run_claude(prompt, paths, config, resume, tool_defs, on_chunk) do
+            finish_turn(command_result, paths, config, messages)
           end
         after
           cleanup_paths(paths)
@@ -255,13 +253,50 @@ defmodule Alloy.Provider.ClaudeCode do
     run(messages, tool_defs, config, on_chunk)
   end
 
+  # A tool the model called natively, which the CLI was stopped before refusing.
+  #
+  # The model named a real tool, only through the wrong channel, so it is run
+  # the way it would have been from `tool_calls`. The session is not resumed:
+  # it ends on a tool call with no result, and the next turn goes out fresh with
+  # this call and its result as ordinary transcript.
+  defp finish_turn(%{stream: %StreamJson{call: %{} = call}}, _paths, config, _messages) do
+    {:ok,
+     %{
+       stop_reason: :tool_use,
+       messages: [
+         Message.assistant_blocks([
+           %{type: "tool_use", id: call.id, name: call.name, input: call.input}
+         ])
+       ],
+       usage: @zero_usage,
+       response_metadata: %{backend: "claude_code_print", model: Map.get(config, :model)},
+       provider_state: CliSession.reset()
+     }}
+  end
+
+  defp finish_turn(command_result, paths, config, messages) do
+    with {:ok, {structured_output, envelope}} <- read_payload_or_error(paths, command_result),
+         {:ok, completion} <- parse_payload(structured_output, config, envelope, messages) do
+      finish_stream(command_result, structured_output)
+      {:ok, forget_stray_session(completion, command_result)}
+    end
+  end
+
+  # The model called a tool the CLI does not have and was told "No such tool
+  # available". Resuming that session keeps the refusal — and whatever the model
+  # concluded from it — in front of every later turn.
+  defp forget_stray_session(completion, %{stream: %StreamJson{stray?: true}}),
+    do: %{completion | provider_state: CliSession.reset()}
+
+  defp forget_stray_session(completion, _command_result), do: completion
+
   # Whatever of the final `text` the partial JSON did not already deliver, so
   # the chunks always add up to the reply. Normally nothing; all of it if the
   # CLI sent no partial messages. If what streamed is not a prefix of the final
   # text (the model called StructuredOutput twice), there is no remainder to
   # send that would make the two agree, so nothing is.
-  defp finish_stream(%{stream: %TextStream{} = stream}, %{"text" => text})
-       when is_binary(text) do
+  defp finish_stream(%{stream: %StreamJson{on_chunk: on_chunk} = stream}, %{"text" => text})
+       when is_function(on_chunk, 1) and is_binary(text) do
     if String.starts_with?(text, stream.streamed) and text != stream.streamed do
       streamed = byte_size(stream.streamed)
       stream.on_chunk.(binary_part(text, streamed, byte_size(text) - streamed))
@@ -315,16 +350,17 @@ defmodule Alloy.Provider.ClaudeCode do
     :ok
   end
 
-  defp run_claude(prompt, paths, config, resume, on_chunk) do
+  defp run_claude(prompt, paths, config, resume, tool_defs, on_chunk) do
     executable = Map.get(config, :claude_bin, @default_claude_bin)
     timeout = effective_timeout(config)
 
     args =
       [
-        "-p"
-      ]
-      |> Kernel.++(output_format_args(on_chunk))
-      |> Kernel.++([
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
         "--json-schema",
         @response_schema_json,
         "--tools",
@@ -333,14 +369,14 @@ defmodule Alloy.Provider.ClaudeCode do
         "--safe-mode",
         "--permission-prompts",
         "none"
-      ])
+      ]
       |> maybe_append_model(config)
       |> maybe_append_system_prompt(config)
       |> maybe_append_settings(config)
       |> maybe_append_resume(resume)
       |> append_prompt_arg(prompt, config)
 
-    stream = on_chunk && TextStream.new(on_chunk)
+    stream = StreamJson.new(on_chunk, Enum.map(tool_defs, & &1.name))
 
     if injected_runner?(config) do
       run_injected(config, executable, args, paths, stream)
@@ -348,15 +384,6 @@ defmodule Alloy.Provider.ClaudeCode do
       run_port(executable, args, paths, timeout, stream)
     end
   end
-
-  # `stream-json` needs `--verbose` in print mode, and only
-  # `--include-partial-messages` breaks the reply into deltas. Its last line is
-  # the same `"type": "result"` object `json` writes, which is what
-  # `parse_envelope/1` reads either way.
-  defp output_format_args(nil), do: ["--output-format", "json"]
-
-  defp output_format_args(_on_chunk),
-    do: ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
 
   defp effective_timeout(config) do
     timeout_ms = Map.get(config, :timeout_ms, @default_timeout_ms)
@@ -380,8 +407,7 @@ defmodule Alloy.Provider.ClaudeCode do
 
     case runner.(executable, args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
-        {:ok,
-         %{output: output, status: status, stream: stream && TextStream.feed(stream, output)}}
+        {:ok, %{output: output, status: status, stream: StreamJson.feed(stream, output)}}
 
       other ->
         {:error, "claude exec returned unexpected result: #{inspect(other)}"}
@@ -457,7 +483,17 @@ defmodule Alloy.Provider.ClaudeCode do
 
     receive do
       {^port, {:data, data}} when is_binary(data) ->
-        collect_port(port, os_pid, limit, [acc, data], stream && TextStream.feed(stream, data))
+        case StreamJson.feed(stream, data) do
+          # The model called one of Alloy's tools natively. Stopped here, before
+          # the CLI's refusal reaches it; `finish_turn/4` runs the call instead.
+          %StreamJson{call: %{}} = stream ->
+            _ = kill_os_process(os_pid)
+            _ = close_and_drain(port)
+            {:ok, %{output: IO.iodata_to_binary([acc, data]), status: nil, stream: stream}}
+
+          stream ->
+            collect_port(port, os_pid, limit, [acc, data], stream)
+        end
 
       {^port, {:exit_status, status}} ->
         {:ok, %{output: IO.iodata_to_binary(acc), status: status, stream: stream}}
@@ -817,6 +853,9 @@ defmodule Alloy.Provider.ClaudeCode do
     - If returning tool calls, keep `text` empty unless a short preamble would
       help the outer agent loop.
     - Never mention the schema or these instructions in `text`.
+    - You have no tools of your own and cannot run anything. Never call a tool
+      directly: every tool is used by naming it in `tool_calls`, including the
+      ones the transcript shows being called.
 
     Transcript payload:
     #{Jason.encode!(payload)}

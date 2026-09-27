@@ -1,29 +1,57 @@
-defmodule Alloy.Provider.ClaudeCode.TextStream do
+defmodule Alloy.Provider.ClaudeCode.StreamJson do
   @moduledoc false
 
-  # Streams the reply text out of `claude -p --output-format stream-json`.
+  # Reads `claude -p --output-format stream-json` as it arrives, for two things.
   #
-  # With `--json-schema` the answer is not text: the model calls Claude Code's
-  # StructuredOutput tool, and what streams is `input_json_delta` fragments of
-  # `{"stop_reason": ..., "text": "...", "tool_calls": [...]}`. The reply the
-  # caller wants is the growing `text` value inside that partial JSON, so each
-  # fragment is appended to the tool input, the `text` string's prefix is decoded
-  # again, and only what is new goes to `on_chunk`.
+  # The reply text. With `--json-schema` the answer is not text: the model calls
+  # Claude Code's StructuredOutput tool, and what streams is `input_json_delta`
+  # fragments of `{"stop_reason": ..., "text": "...", "tool_calls": [...]}`. The
+  # growing `text` value inside that partial JSON is decoded again per fragment
+  # and only what is new goes to `on_chunk`. Only the StructuredOutput block's
+  # input is read that way; any other tool's input is not the reply.
+  #
+  # Tools called natively. `claude -p` runs its own agent loop, and the model
+  # sometimes calls a tool directly instead of naming it in `tool_calls` —
+  # measured on a fresh session carrying a long transcript full of tool calls.
+  # With `--tools ""` the CLI answers `No such tool available: <name>` to the
+  # model, inside the same invocation, and the model concludes its tools are
+  # gone: one agent made 27 refusals and 0 real calls, every one a `--resume` of
+  # the session that first saw the refusals. So a native call is noticed the
+  # moment its assistant message arrives: one naming a tool Alloy has is `call`,
+  # to be run by Alloy instead; any other makes the session `stray`.
   #
   # Re-scanning the whole input per fragment is quadratic, and fine: it is one
   # reply, a few kilobytes.
 
-  defstruct [:on_chunk, line: "", json: "", streamed: ""]
+  defstruct [
+    :on_chunk,
+    known: MapSet.new(),
+    line: "",
+    json: "",
+    streamed: "",
+    in_structured?: false,
+    call: nil,
+    stray?: false
+  ]
 
   @type t :: %__MODULE__{
-          on_chunk: (String.t() -> any()),
+          on_chunk: (String.t() -> any()) | nil,
+          known: MapSet.t(String.t()),
           line: binary(),
           json: binary(),
-          streamed: String.t()
+          streamed: String.t(),
+          in_structured?: boolean(),
+          call: map() | nil,
+          stray?: boolean()
         }
 
-  @spec new((String.t() -> any())) :: t()
-  def new(on_chunk) when is_function(on_chunk, 1), do: %__MODULE__{on_chunk: on_chunk}
+  @structured "StructuredOutput"
+
+  @doc false
+  # `known` is the names of the tools Alloy offered this turn.
+  @spec new((String.t() -> any()) | nil, [String.t()]) :: t()
+  def new(on_chunk, known) when is_nil(on_chunk) or is_function(on_chunk, 1),
+    do: %__MODULE__{on_chunk: on_chunk, known: MapSet.new(known)}
 
   @doc false
   # Raw stdout, in whatever pieces the port delivers; lines can straddle them.
@@ -36,10 +64,16 @@ defmodule Alloy.Provider.ClaudeCode.TextStream do
     |> Enum.reduce(%{state | line: partial}, &handle_line/2)
   end
 
+  defp handle_line(_line, %__MODULE__{call: call} = state) when call != nil, do: state
+
   defp handle_line(line, state) do
     case Jason.decode(line) do
-      {:ok, %{"type" => "stream_event", "event" => %{"type" => "content_block_start"}}} ->
-        %{state | json: ""}
+      {:ok,
+       %{
+         "type" => "stream_event",
+         "event" => %{"type" => "content_block_start", "content_block" => block}
+       }} ->
+        %{state | json: "", in_structured?: match?(%{"name" => @structured}, block)}
 
       {:ok,
        %{
@@ -50,12 +84,30 @@ defmodule Alloy.Provider.ClaudeCode.TextStream do
          }
        }}
       when is_binary(fragment) ->
-        emit(%{state | json: state.json <> fragment})
+        if state.in_structured?, do: emit(%{state | json: state.json <> fragment}), else: state
+
+      {:ok, %{"type" => "assistant", "message" => %{"content" => blocks}}} when is_list(blocks) ->
+        Enum.reduce(blocks, state, &native_call/2)
 
       _ ->
         state
     end
   end
+
+  defp native_call(%{"type" => "tool_use", "name" => @structured}, state), do: state
+
+  defp native_call(%{"type" => "tool_use", "name" => name} = block, %{call: nil} = state)
+       when is_binary(name) do
+    if MapSet.member?(state.known, name) do
+      %{state | call: %{id: block["id"], name: name, input: block["input"] || %{}}}
+    else
+      %{state | stray?: true}
+    end
+  end
+
+  defp native_call(_block, state), do: state
+
+  defp emit(%{on_chunk: nil} = state), do: state
 
   defp emit(state) do
     with text when is_binary(text) <- text_prefix(state.json),
