@@ -138,16 +138,20 @@ defmodule Alloy.Provider.ClaudeCode do
   - Usage accounting reflects the real numbers from the CLI's
     `--output-format json` envelope (`usage.input_tokens` /
     `usage.output_tokens`), unlike Codex's hardcoded zero usage, so
-    `max_budget_cents` guards work against this provider.
-  - Streaming is emulated by running a normal completion and replaying the
-    final text to the provided callback - same as Codex. Claude Code supports
-    real NDJSON streaming (`--output-format stream-json --include-partial-messages`)
-    but that is a separate piece of work, not implemented here.
+    `max_budget_cents` guards work against this provider. Codex's zero-usage
+    note no longer applies; it reports real usage too.
+  - `stream/4` streams for real: it runs `--output-format stream-json
+    --include-partial-messages` and passes the reply's `text` to the callback
+    as it arrives. Under `--json-schema` the reply streams as fragments of the
+    StructuredOutput tool's JSON input rather than as text, so
+    `Alloy.Provider.ClaudeCode.TextStream` decodes the growing `text` value out
+    of it. The chunks always add up to the final `text`.
   """
 
   @behaviour Alloy.Provider
 
   alias Alloy.Message
+  alias Alloy.Provider.ClaudeCode.TextStream
   alias Alloy.Provider.CliSession
 
   @default_timeout_ms 120_000
@@ -209,7 +213,11 @@ defmodule Alloy.Provider.ClaudeCode do
   @impl true
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
-  def complete(messages, tool_defs, config) do
+  def complete(messages, tool_defs, config), do: run(messages, tool_defs, config, nil)
+
+  # `on_chunk` nil is a plain completion; a function streams the reply text
+  # into it as `stream-json` delivers it.
+  defp run(messages, tool_defs, config, on_chunk) do
     case prepare_paths(config) do
       {:ok, paths} ->
         try do
@@ -217,9 +225,10 @@ defmodule Alloy.Provider.ClaudeCode do
           prompt = build_turn_prompt(resume, messages, tool_defs, config)
 
           with :ok <- File.write(paths.prompt_path, prompt),
-               {:ok, command_result} <- run_claude(prompt, paths, config, resume),
+               {:ok, command_result} <- run_claude(prompt, paths, config, resume, on_chunk),
                {:ok, {structured_output, envelope}} <-
                  read_payload_or_error(paths, command_result) do
+            finish_stream(command_result, structured_output)
             parse_payload(structured_output, config, envelope, messages)
           end
         after
@@ -243,11 +252,25 @@ defmodule Alloy.Provider.ClaudeCode do
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    with {:ok, result} <- complete(messages, tool_defs, config),
-         :ok <- emit_chunks(result, on_chunk) do
-      {:ok, result}
-    end
+    run(messages, tool_defs, config, on_chunk)
   end
+
+  # Whatever of the final `text` the partial JSON did not already deliver, so
+  # the chunks always add up to the reply. Normally nothing; all of it if the
+  # CLI sent no partial messages. If what streamed is not a prefix of the final
+  # text (the model called StructuredOutput twice), there is no remainder to
+  # send that would make the two agree, so nothing is.
+  defp finish_stream(%{stream: %TextStream{} = stream}, %{"text" => text})
+       when is_binary(text) do
+    if String.starts_with?(text, stream.streamed) and text != stream.streamed do
+      streamed = byte_size(stream.streamed)
+      stream.on_chunk.(binary_part(text, streamed, byte_size(text) - streamed))
+    end
+
+    :ok
+  end
+
+  defp finish_stream(_command_result, _structured_output), do: :ok
 
   defp prepare_paths(config) do
     base_dir = build_base_dir(config)
@@ -292,15 +315,16 @@ defmodule Alloy.Provider.ClaudeCode do
     :ok
   end
 
-  defp run_claude(prompt, paths, config, resume) do
+  defp run_claude(prompt, paths, config, resume, on_chunk) do
     executable = Map.get(config, :claude_bin, @default_claude_bin)
     timeout = effective_timeout(config)
 
     args =
       [
-        "-p",
-        "--output-format",
-        "json",
+        "-p"
+      ]
+      |> Kernel.++(output_format_args(on_chunk))
+      |> Kernel.++([
         "--json-schema",
         @response_schema_json,
         "--tools",
@@ -309,19 +333,30 @@ defmodule Alloy.Provider.ClaudeCode do
         "--safe-mode",
         "--permission-prompts",
         "none"
-      ]
+      ])
       |> maybe_append_model(config)
       |> maybe_append_system_prompt(config)
       |> maybe_append_settings(config)
       |> maybe_append_resume(resume)
       |> append_prompt_arg(prompt, config)
 
+    stream = on_chunk && TextStream.new(on_chunk)
+
     if injected_runner?(config) do
-      run_injected(config, executable, args, paths)
+      run_injected(config, executable, args, paths, stream)
     else
-      run_port(executable, args, paths, timeout)
+      run_port(executable, args, paths, timeout, stream)
     end
   end
+
+  # `stream-json` needs `--verbose` in print mode, and only
+  # `--include-partial-messages` breaks the reply into deltas. Its last line is
+  # the same `"type": "result"` object `json` writes, which is what
+  # `parse_envelope/1` reads either way.
+  defp output_format_args(nil), do: ["--output-format", "json"]
+
+  defp output_format_args(_on_chunk),
+    do: ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
 
   defp effective_timeout(config) do
     timeout_ms = Map.get(config, :timeout_ms, @default_timeout_ms)
@@ -339,13 +374,14 @@ defmodule Alloy.Provider.ClaudeCode do
   # `System.cmd/3`. Its return value is treated as stdout - unlike Codex,
   # there is no output file to intercept, since Claude Code's structured
   # payload comes back on stdout itself.
-  defp run_injected(config, executable, args, paths) do
+  defp run_injected(config, executable, args, paths, stream) do
     runner = Map.fetch!(config, :command_runner)
     opts = [cd: paths.workdir, stderr_to_stdout: false]
 
     case runner.(executable, args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
-        {:ok, %{output: output, status: status}}
+        {:ok,
+         %{output: output, status: status, stream: stream && TextStream.feed(stream, output)}}
 
       other ->
         {:error, "claude exec returned unexpected result: #{inspect(other)}"}
@@ -365,7 +401,7 @@ defmodule Alloy.Provider.ClaudeCode do
   # into stdout via Port options) so that stray diagnostic output can never
   # corrupt the single JSON result object `--output-format json` writes to
   # stdout.
-  defp run_port(executable, args, paths, timeout) do
+  defp run_port(executable, args, paths, timeout, stream) do
     shell_command = build_port_command(executable, args, paths)
 
     port =
@@ -383,10 +419,15 @@ defmodule Alloy.Provider.ClaudeCode do
     # Port.info/2 returns nil when the process already exited - its output
     # and exit_status messages are still in the mailbox, so collect them;
     # there is just no OS pid left to kill on timeout.
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, [])
-      nil -> collect_port(port, nil, timeout, [])
-    end
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, os_pid} -> os_pid
+        nil -> nil
+      end
+
+    collect_port(port, os_pid, {deadline, timeout}, [], stream)
   rescue
     error in ErlangError ->
       {:error, "claude exec failed to start: #{Exception.message(error)}"}
@@ -408,15 +449,20 @@ defmodule Alloy.Provider.ClaudeCode do
       shell_escape(paths.stderr_path)
   end
 
-  defp collect_port(port, os_pid, timeout, acc) do
+  # A deadline, not a per-message timeout: a streaming run delivers data every
+  # few hundred milliseconds, and an `after` that restarts on each message would
+  # never fire on one that streams forever.
+  defp collect_port(port, os_pid, {deadline, timeout} = limit, acc, stream) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
     receive do
       {^port, {:data, data}} when is_binary(data) ->
-        collect_port(port, os_pid, timeout, [acc, data])
+        collect_port(port, os_pid, limit, [acc, data], stream && TextStream.feed(stream, data))
 
       {^port, {:exit_status, status}} ->
-        {:ok, %{output: IO.iodata_to_binary(acc), status: status}}
+        {:ok, %{output: IO.iodata_to_binary(acc), status: status, stream: stream}}
     after
-      timeout ->
+      remaining ->
         _ = kill_os_process(os_pid)
         _ = close_and_drain(port)
         {:error, "claude exec timed out after #{timeout}ms"}
@@ -665,22 +711,6 @@ defmodule Alloy.Provider.ClaudeCode do
   defp fetch_arguments(_map) do
     {:error, "Claude Code tool call is missing its arguments object"}
   end
-
-  defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
-    on_chunk.(text)
-    :ok
-  end
-
-  defp emit_chunks(%{messages: [%Message{content: blocks}]}, on_chunk) when is_list(blocks) do
-    blocks
-    |> Enum.filter(&match?(%{type: "text", text: _}, &1))
-    |> Enum.each(fn %{text: text} -> on_chunk.(text) end)
-
-    :ok
-  end
-
-  # Unknown shape - skip silently rather than crash the stream caller.
-  defp emit_chunks(_result, _on_chunk), do: :ok
 
   # Including the cached halves, which are nearly all of it.
   #
