@@ -245,6 +245,10 @@ defmodule Alloy.Provider.ClaudeCode do
     build_incremental_prompt(new_messages, changed, config)
   end
 
+  defp build_turn_prompt(:fresh, messages, tool_defs, config) do
+    build_prompt(messages, tool_defs, config)
+  end
+
   # The session already holds the tool definitions it was last sent, so a
   # resumed call repeats them only when they changed. Re-sending ~12k chars of
   # tool schema on every call is what filled a resumed session to its
@@ -259,10 +263,6 @@ defmodule Alloy.Provider.ClaudeCode do
   defp remember_tools(completion, _tool_defs), do: completion
 
   defp tools_hash(tool_defs), do: :erlang.phash2(Enum.map(tool_defs, &serialize_tool_def/1))
-
-  defp build_turn_prompt(:fresh, messages, tool_defs, config) do
-    build_prompt(messages, tool_defs, config)
-  end
 
   @impl true
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
