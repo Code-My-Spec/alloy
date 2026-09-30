@@ -711,7 +711,8 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert result.provider_state == %{
                session_id: "sess_abc123",
                sent_upto: 2,
-               prefix_hash: :erlang.phash2(messages ++ [reply])
+               prefix_hash: :erlang.phash2(messages ++ [reply]),
+               tools_hash: :erlang.phash2([])
              }
     end
 
@@ -770,8 +771,57 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert result2.provider_state == %{
                session_id: "sess_1",
                sent_upto: length(messages2) + 1,
-               prefix_hash: :erlang.phash2(messages2 ++ [List.first(result2.messages)])
+               prefix_hash: :erlang.phash2(messages2 ++ [List.first(result2.messages)]),
+               tools_hash: :erlang.phash2([])
              }
+    end
+
+    # Re-sending every tool definition on every resumed call filled a
+    # resumed session to its compaction limit in hours.
+    test "a resumed call sends the tool definitions only when they changed" do
+      parent = self()
+      tool = %{name: "read_file", description: "Read a file", input_schema: %{type: "object"}}
+      other = %{name: "write_file", description: "Write a file", input_schema: %{type: "object"}}
+
+      runner =
+        fake_runner(fn args, _opts ->
+          send(parent, {:call, args})
+
+          {envelope(
+             %{"stop_reason" => "end_turn", "text" => "ok", "tool_calls" => []},
+             session_id: "sess_t"
+           ), 0}
+        end)
+
+      messages1 = [Message.user("Hi")]
+      assert {:ok, r1} = ClaudeCode.complete(messages1, [tool], %{command_runner: runner})
+      assert_receive {:call, first}
+      assert List.last(first) =~ "read_file"
+
+      messages2 = messages1 ++ [List.first(r1.messages), Message.user("Again")]
+
+      assert {:ok, r2} =
+               ClaudeCode.complete(messages2, [tool], %{
+                 command_runner: runner,
+                 provider_state: r1.provider_state
+               })
+
+      assert_receive {:call, second}
+      assert "--resume" in second
+      refute List.last(second) =~ "available_tools"
+
+      messages3 = messages2 ++ [List.first(r2.messages), Message.user("New tools")]
+
+      assert {:ok, _} =
+               ClaudeCode.complete(messages3, [tool, other], %{
+                 command_runner: runner,
+                 provider_state: r2.provider_state
+               })
+
+      assert_receive {:call, third}
+      assert "--resume" in third
+      assert List.last(third) =~ "available_tools"
+      assert List.last(third) =~ "write_file"
     end
 
     test "a prefix mismatch falls back to a fresh full resend rather than trusting a stale resume" do
@@ -989,7 +1039,13 @@ defmodule Alloy.Provider.ClaudeCodeTest do
              ]
 
       refute inspect(result.messages) =~ "outage"
-      assert result.provider_state == %{session_id: nil, sent_upto: nil, prefix_hash: nil}
+
+      assert result.provider_state == %{
+               session_id: nil,
+               sent_upto: nil,
+               prefix_hash: nil,
+               tools_hash: nil
+             }
     end
 
     test "one Alloy does not have leaves the reply alone but does not resume the session" do
@@ -1000,7 +1056,13 @@ defmodule Alloy.Provider.ClaudeCodeTest do
 
       assert {:ok, result} = ClaudeCode.complete([Message.user("go")], [@read_tool], config)
       assert result.stop_reason == :end_turn
-      assert result.provider_state == %{session_id: nil, sent_upto: nil, prefix_hash: nil}
+
+      assert result.provider_state == %{
+               session_id: nil,
+               sent_upto: nil,
+               prefix_hash: nil,
+               tools_hash: nil
+             }
     end
 
     test "its input is not streamed as the reply" do

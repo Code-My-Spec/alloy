@@ -226,8 +226,9 @@ defmodule Alloy.Provider.ClaudeCode do
 
           with :ok <- File.write(paths.prompt_path, prompt),
                {:ok, command_result} <-
-                 run_claude(prompt, paths, config, resume, tool_defs, on_chunk) do
-            finish_turn(command_result, paths, config, messages)
+                 run_claude(prompt, paths, config, resume, tool_defs, on_chunk),
+               {:ok, completion} <- finish_turn(command_result, paths, config, messages) do
+            {:ok, remember_tools(completion, tool_defs)}
           end
         after
           cleanup_paths(paths)
@@ -239,8 +240,25 @@ defmodule Alloy.Provider.ClaudeCode do
   end
 
   defp build_turn_prompt({:resume, _session_id, new_messages}, _messages, tool_defs, config) do
-    build_incremental_prompt(new_messages, tool_defs, config)
+    known = (Map.get(config, :provider_state) || %{}) |> Map.get(:tools_hash)
+    changed = if known == tools_hash(tool_defs), do: nil, else: tool_defs
+    build_incremental_prompt(new_messages, changed, config)
   end
+
+  # The session already holds the tool definitions it was last sent, so a
+  # resumed call repeats them only when they changed. Re-sending ~12k chars of
+  # tool schema on every call is what filled a resumed session to its
+  # compaction limit in hours.
+  defp remember_tools(%{provider_state: %{session_id: id} = state} = completion, tool_defs)
+       when is_binary(id),
+       do: %{completion | provider_state: Map.put(state, :tools_hash, tools_hash(tool_defs))}
+
+  defp remember_tools(%{provider_state: %{} = state} = completion, _tool_defs),
+    do: %{completion | provider_state: Map.put(state, :tools_hash, nil)}
+
+  defp remember_tools(completion, _tool_defs), do: completion
+
+  defp tools_hash(tool_defs), do: :erlang.phash2(Enum.map(tool_defs, &serialize_tool_def/1))
 
   defp build_turn_prompt(:fresh, messages, tool_defs, config) do
     build_prompt(messages, tool_defs, config)
@@ -865,15 +883,13 @@ defmodule Alloy.Provider.ClaudeCode do
   # Sent instead of `build_prompt/3` when resuming: Claude Code's own
   # resumed session already has the framing, response rules, and every
   # earlier message from `build_prompt/3`'s first call - re-sending any of
-  # that would be exactly the token cost `--resume` exists to avoid. Only
-  # `available_tools` is repeated on every call regardless, since tool defs
-  # can in principle change between turns and a resumed session has no way
-  # to learn that except being told again.
+  # that would be exactly the token cost `--resume` exists to avoid.
+  # `available_tools` is sent only when the definitions changed since the
+  # session last saw them (`tool_defs` nil otherwise).
   defp build_incremental_prompt(new_messages, tool_defs, _config) do
-    payload = %{
-      conversation: Enum.map(new_messages, &serialize_message/1),
-      available_tools: Enum.map(tool_defs, &serialize_tool_def/1)
-    }
+    payload =
+      %{conversation: Enum.map(new_messages, &serialize_message/1)}
+      |> put_tools(tool_defs)
 
     """
     Continuing the same conversation. Produce exactly one JSON object
@@ -884,6 +900,11 @@ defmodule Alloy.Provider.ClaudeCode do
     #{Jason.encode!(payload)}
     """
   end
+
+  defp put_tools(payload, nil), do: payload
+
+  defp put_tools(payload, tool_defs),
+    do: Map.put(payload, :available_tools, Enum.map(tool_defs, &serialize_tool_def/1))
 
   defp serialize_message(%Message{role: role, content: content}) when is_binary(content) do
     %{role: Atom.to_string(role), content: content}
