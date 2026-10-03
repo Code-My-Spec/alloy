@@ -708,10 +708,63 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       result = ClaudeCode.complete([Message.user("deadline")], [], config)
       elapsed = System.monotonic_time(:millisecond) - started_at
 
-      assert {:error, "claude exec timed out after 150ms"} = result
+      assert {:error, "claude exec timed out after 150ms with no output"} = result
 
       assert elapsed < 5_000,
              "expected receive_timeout to cap the port timeout, took #{elapsed}ms"
+    end
+
+    # eb09b076: a slow reply on a large context kept streaming and was killed at
+    # three minutes anyway, every turn.
+    test "a run that keeps writing is not cut off at timeout_ms" do
+      script =
+        fake_cli("""
+        i=0
+        while [ $i -lt 12 ]; do
+          printf '%s\\n' '{"type":"system","subtype":"status"}'
+          sleep 0.1
+          i=$((i+1))
+        done
+        printf '%s\\n' '#{envelope(%{"stop_reason" => "end_turn", "text" => "slow but steady", "tool_calls" => []})}'
+        """)
+
+      config = %{model: "claude-sonnet-5", claude_bin: script, timeout_ms: 400}
+
+      assert {:ok, result} = ClaudeCode.complete([Message.user("go")], [], config)
+      assert result.messages == [Message.assistant("slow but steady")]
+    end
+
+    test "a run that writes forever still stops at max_run_ms" do
+      script =
+        fake_cli("""
+        while true; do
+          printf '%s\\n' '{"type":"system","subtype":"status"}'
+          sleep 0.1
+        done
+        """)
+
+      config = %{model: "claude-sonnet-5", claude_bin: script, timeout_ms: 400, max_run_ms: 800}
+
+      started_at = System.monotonic_time(:millisecond)
+      result = ClaudeCode.complete([Message.user("go")], [], config)
+      elapsed = System.monotonic_time(:millisecond) - started_at
+
+      assert {:error,
+              "claude exec timed out after 800ms, its limit for one run, while still writing"} =
+               result
+
+      assert elapsed < 5_000
+    end
+
+    defp fake_cli(body) do
+      dir = Path.join(System.tmp_dir!(), "alloy-cc-fake-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      script = Path.join(dir, "claude.sh")
+      File.write!(script, "#!/bin/sh\ncat > /dev/null\n" <> body)
+      File.chmod!(script, 0o755)
+      script
     end
   end
 

@@ -28,8 +28,11 @@ defmodule Alloy.Provider.ClaudeCode do
   - `:settings_path` - Passed through as `--settings <path>` when present
   - `:tmp_dir` - Parent for the provider's temp working directory
     (default: `System.tmp_dir!/0`)
-  - `:timeout_ms` - Timeout for a single `claude` invocation
-    (default: `120_000`)
+  - `:timeout_ms` - How long a `claude` invocation may go without writing
+    any output before it is stopped (default: `120_000`). Restarts with every
+    chunk, so a long reply that keeps streaming is not cut off.
+  - `:max_run_ms` - The most one invocation may run in total, streaming or not
+    (default: 30 minutes)
   - `:receive_timeout` - Optional turn deadline timeout injected by Alloy's
     retry loop; when present it caps `:timeout_ms`
   - `:command_runner` - Test hook matching `System.cmd/3`
@@ -155,6 +158,7 @@ defmodule Alloy.Provider.ClaudeCode do
   alias Alloy.Provider.CliSession
 
   @default_timeout_ms 120_000
+  @default_max_run_ms :timer.minutes(30)
   @default_claude_bin "claude"
   @output_truncation 4_000
   @error_truncation 2_000
@@ -203,6 +207,7 @@ defmodule Alloy.Provider.ClaudeCode do
           optional(:settings_path) => String.t(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
+          optional(:max_run_ms) => pos_integer(),
           optional(:receive_timeout) => pos_integer(),
           optional(:system_prompt) => String.t(),
           optional(:command_runner) => (String.t(), [String.t()], keyword() ->
@@ -399,9 +404,11 @@ defmodule Alloy.Provider.ClaudeCode do
     if injected_runner?(config) do
       run_injected(config, executable, args, paths, stream)
     else
-      run_port(executable, args, paths, timeout, stream)
+      run_port(executable, args, paths, {timeout, max_run(config)}, stream)
     end
   end
+
+  defp max_run(config), do: Map.get(config, :max_run_ms, @default_max_run_ms)
 
   defp effective_timeout(config) do
     timeout_ms = Map.get(config, :timeout_ms, @default_timeout_ms)
@@ -445,7 +452,7 @@ defmodule Alloy.Provider.ClaudeCode do
   # into stdout via Port options) so that stray diagnostic output can never
   # corrupt the single JSON result object `--output-format json` writes to
   # stdout.
-  defp run_port(executable, args, paths, timeout, stream) do
+  defp run_port(executable, args, paths, {timeout, max_run}, stream) do
     shell_command = build_port_command(executable, args, paths)
 
     port =
@@ -463,7 +470,14 @@ defmodule Alloy.Provider.ClaudeCode do
     # Port.info/2 returns nil when the process already exited - its output
     # and exit_status messages are still in the mailbox, so collect them;
     # there is just no OS pid left to kill on timeout.
-    deadline = System.monotonic_time(:millisecond) + timeout
+    now = System.monotonic_time(:millisecond)
+
+    limits = %{
+      idle: timeout,
+      quiet_until: now + timeout,
+      max_run: max_run,
+      run_until: now + max_run
+    }
 
     os_pid =
       case Port.info(port, :os_pid) do
@@ -471,7 +485,7 @@ defmodule Alloy.Provider.ClaudeCode do
         nil -> nil
       end
 
-    collect_port(port, os_pid, {deadline, timeout}, [], stream)
+    collect_port(port, os_pid, limits, [], stream)
   rescue
     error in ErlangError ->
       {:error, "claude exec failed to start: #{Exception.message(error)}"}
@@ -493,11 +507,15 @@ defmodule Alloy.Provider.ClaudeCode do
       shell_escape(paths.stderr_path)
   end
 
-  # A deadline, not a per-message timeout: a streaming run delivers data every
-  # few hundred milliseconds, and an `after` that restarts on each message would
-  # never fire on one that streams forever.
-  defp collect_port(port, os_pid, {deadline, timeout} = limit, acc, stream) do
-    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+  # Two limits. `:timeout_ms` is how long the CLI may go without writing
+  # anything, and restarts on every chunk: a run is cut off for going quiet,
+  # not for being long. It was a deadline on the whole run, and a slow but
+  # streaming reply on a large context was killed at three minutes, every turn,
+  # with nothing produced (eb09b076). `:max_run_ms` is the deadline, for a run
+  # that writes forever.
+  defp collect_port(port, os_pid, limits, acc, stream) do
+    now = System.monotonic_time(:millisecond)
+    remaining = max(min(limits.quiet_until, limits.run_until) - now, 0)
 
     receive do
       {^port, {:data, data}} when is_binary(data) ->
@@ -510,7 +528,8 @@ defmodule Alloy.Provider.ClaudeCode do
             {:ok, %{output: IO.iodata_to_binary([acc, data]), status: nil, stream: stream}}
 
           stream ->
-            collect_port(port, os_pid, limit, [acc, data], stream)
+            limits = %{limits | quiet_until: System.monotonic_time(:millisecond) + limits.idle}
+            collect_port(port, os_pid, limits, [acc, data], stream)
         end
 
       {^port, {:exit_status, status}} ->
@@ -519,7 +538,17 @@ defmodule Alloy.Provider.ClaudeCode do
       remaining ->
         _ = kill_os_process(os_pid)
         _ = close_and_drain(port)
-        {:error, "claude exec timed out after #{timeout}ms"}
+        {:error, timeout_message(limits)}
+    end
+  end
+
+  # Both start `claude exec timed out after <ms>ms`, which callers read a
+  # timeout off; what follows says which limit it was.
+  defp timeout_message(%{run_until: run_until, max_run: max_run} = limits) do
+    if System.monotonic_time(:millisecond) >= run_until do
+      "claude exec timed out after #{max_run}ms, its limit for one run, while still writing"
+    else
+      "claude exec timed out after #{limits.idle}ms with no output"
     end
   end
 
