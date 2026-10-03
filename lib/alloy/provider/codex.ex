@@ -144,7 +144,7 @@ defmodule Alloy.Provider.Codex do
           with :ok <- File.write(paths.schema_path, @response_schema_json) do
             config
             |> CliSession.explain(messages)
-            |> report_plan()
+            |> report_plan(on_chunk)
             |> run_turn(messages, tool_defs, paths, config, on_chunk)
           end
         after
@@ -157,17 +157,25 @@ defmodule Alloy.Provider.Codex do
   end
 
   # An agent's first turn has no thread to resume, so it says nothing. Any
-  # other fresh turn starts a new thread and re-sends the whole transcript.
-  defp report_plan({:fresh, :history_rewritten} = plan) do
+  # other fresh turn starts a new thread and re-sends the whole transcript, and
+  # a streaming caller is told so as the turn begins: the callback's text is a
+  # live draft, never the stored reply.
+  defp report_plan({:fresh, :history_rewritten} = plan, on_chunk) do
     Logger.info(
       "Alloy.Provider.Codex starting a new thread: earlier history changed " <>
         "since the last turn (compaction), so the full transcript goes out"
     )
 
+    notify(on_chunk, "earlier history changed (compaction)")
     plan
   end
 
-  defp report_plan(plan), do: plan
+  defp report_plan(plan, _on_chunk), do: plan
+
+  defp notify(nil, _why), do: :ok
+
+  defp notify(on_chunk, why),
+    do: on_chunk.("[new Codex thread: #{why}; the whole transcript goes out uncached]\n")
 
   defp run_turn(plan, messages, tool_defs, paths, config, on_chunk) do
     prompt = build_turn_prompt(plan, messages, tool_defs, config)
@@ -186,6 +194,7 @@ defmodule Alloy.Provider.Codex do
         )
 
         _ = File.rm(paths.last_message_path)
+        notify(on_chunk, "the previous thread could not be resumed")
         run_turn({:fresh, :resume_failed}, messages, tool_defs, paths, config, on_chunk)
 
       {:error, _reason} = error ->

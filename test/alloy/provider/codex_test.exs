@@ -665,6 +665,35 @@ defmodule Alloy.Provider.CodexTest do
       assert result.messages == [Message.assistant("Rivers flow.")]
     end
 
+    test "tells a streaming caller when a turn starts a new thread" do
+      parent = self()
+      thread = "01a0e329-c415-74d3-a094-f28ef64e03cc"
+      reply = Jason.encode!(%{stop_reason: "end_turn", text: "Going", tool_calls: []})
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: thread, sent_upto: 2, prefix_hash: 0},
+        command_runner:
+          fake_runner(fn _args, _opts, output_path ->
+            File.write!(output_path, reply)
+            ~s({"type":"thread.started","thread_id":"t-2"})
+          end)
+      }
+
+      messages = [Message.user("Compacted summary"), Message.assistant("OK"), Message.user("Go")]
+
+      ExUnit.CaptureLog.with_log(fn ->
+        Codex.stream(messages, [], config, fn chunk ->
+          send(parent, {:chunk, chunk})
+          :ok
+        end)
+      end)
+
+      assert_receive {:chunk, notice}
+      assert notice =~ "new Codex thread"
+      assert notice =~ "compaction"
+    end
+
     # The fake codex prints its first message and then waits for a file that
     # only the callback creates. Chunks handed on at exit would never create
     # it, and the turn would time out instead of finishing.
