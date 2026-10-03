@@ -57,8 +57,12 @@ defmodule Alloy.Provider.Codex do
     `input_tokens` includes the cached part; it is reported here as Alloy
     counts it, with `input_tokens` the uncached remainder and
     `cache_read_input_tokens` the cached part.
-  - Streaming is emulated by running a normal completion and replaying the final
-    text to the provided callback.
+  - `stream/4` reads `--json` as Codex writes it and hands the callback each
+    message as it completes and each shell command as it starts. Codex emits
+    whole items, not tokens, so a message arrives in one piece.
+  - `response_metadata.session` says whether the turn resumed its thread or
+    went out fresh, and why. A fresh turn after the first is a new thread and
+    a cold cache, and is logged.
   """
 
   @behaviour Alloy.Provider
@@ -128,13 +132,20 @@ defmodule Alloy.Provider.Codex do
   @spec complete([Message.t()], [Alloy.Provider.tool_def()], config()) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def complete(messages, tool_defs, config) do
+    with {:ok, result, _streamed} <- run(messages, tool_defs, config, nil) do
+      {:ok, result}
+    end
+  end
+
+  defp run(messages, tool_defs, config, on_chunk) do
     case prepare_paths(config) do
       {:ok, paths} ->
         try do
           with :ok <- File.write(paths.schema_path, @response_schema_json) do
             config
-            |> CliSession.plan(messages)
-            |> run_turn(messages, tool_defs, paths, config)
+            |> CliSession.explain(messages)
+            |> report_plan()
+            |> run_turn(messages, tool_defs, paths, config, on_chunk)
           end
         after
           cleanup_paths(paths)
@@ -145,13 +156,28 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp run_turn(plan, messages, tool_defs, paths, config) do
+  # An agent's first turn has no thread to resume, so it says nothing. Any
+  # other fresh turn starts a new thread and re-sends the whole transcript.
+  defp report_plan({:fresh, :history_rewritten} = plan) do
+    Logger.info(
+      "Alloy.Provider.Codex starting a new thread: earlier history changed " <>
+        "since the last turn (compaction), so the full transcript goes out"
+    )
+
+    plan
+  end
+
+  defp report_plan(plan), do: plan
+
+  defp run_turn(plan, messages, tool_defs, paths, config, on_chunk) do
     prompt = build_turn_prompt(plan, messages, tool_defs, config)
 
     with :ok <- File.write(paths.prompt_path, prompt),
-         {:ok, command_result} <- run_codex(prompt, paths, config, plan),
-         {:ok, payload} <- read_turn_payload(plan, paths.last_message_path, command_result) do
-      parse_payload(payload, config, command_result, messages)
+         {:ok, command_result} <- run_codex(prompt, paths, config, plan, on_chunk),
+         {:ok, payload} <- read_turn_payload(plan, paths.last_message_path, command_result),
+         {:ok, result} <-
+           parse_payload(payload, config, Map.put(command_result, :plan, plan), messages) do
+      {:ok, result, command_result.streamed_reply}
     else
       {:resume_failed, session_id, reason} ->
         Logger.warning(
@@ -160,7 +186,7 @@ defmodule Alloy.Provider.Codex do
         )
 
         _ = File.rm(paths.last_message_path)
-        run_turn(:fresh, messages, tool_defs, paths, config)
+        run_turn({:fresh, :resume_failed}, messages, tool_defs, paths, config, on_chunk)
 
       {:error, _reason} = error ->
         error
@@ -178,24 +204,29 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
-  defp read_turn_payload(:fresh, path, command_result),
+  defp read_turn_payload({:fresh, _reason}, path, command_result),
     do: read_payload_or_error(path, command_result)
 
   defp build_turn_prompt({:resume, _session_id, new_messages}, _messages, tool_defs, _config),
     do: build_incremental_prompt(new_messages, tool_defs)
 
-  defp build_turn_prompt(:fresh, messages, tool_defs, config),
+  defp build_turn_prompt({:fresh, _reason}, messages, tool_defs, config),
     do: build_prompt(messages, tool_defs, config)
 
   @impl true
   @spec stream([Message.t()], [Alloy.Provider.tool_def()], config(), (String.t() -> :ok)) ::
           {:ok, Alloy.Provider.completion_response()} | {:error, term()}
   def stream(messages, tool_defs, config, on_chunk) when is_function(on_chunk, 1) do
-    with {:ok, result} <- complete(messages, tool_defs, config),
-         :ok <- emit_chunks(result, on_chunk) do
+    with {:ok, result, streamed} <- run(messages, tool_defs, config, on_chunk),
+         :ok <- replay_unless_streamed(streamed, result, on_chunk) do
       {:ok, result}
     end
   end
+
+  # A reply that never went out as an event (an older CLI, a decode that only
+  # succeeded after repair) is replayed whole, as before.
+  defp replay_unless_streamed(true, _result, _on_chunk), do: :ok
+  defp replay_unless_streamed(false, result, on_chunk), do: emit_chunks(result, on_chunk)
 
   defp prepare_paths(config) do
     base_dir = build_base_dir(config)
@@ -271,7 +302,7 @@ defmodule Alloy.Provider.Codex do
 
   defp codex_home_name(_config), do: "alloy-codex-home"
 
-  defp run_codex(prompt, paths, config, plan) do
+  defp run_codex(prompt, paths, config, plan, on_chunk) do
     executable = Map.get(config, :codex_bin, @default_codex_bin)
     timeout = effective_timeout(config)
 
@@ -291,9 +322,9 @@ defmodule Alloy.Provider.Codex do
       |> append_prompt_arg(prompt, config)
 
     if injected_runner?(config) do
-      run_injected(config, executable, args, paths)
+      run_injected(config, executable, args, paths, on_chunk)
     else
-      run_port(executable, args, paths, timeout)
+      run_port(executable, args, paths, timeout, on_chunk)
     end
   end
 
@@ -312,13 +343,14 @@ defmodule Alloy.Provider.Codex do
   # Test path: the caller supplies a synchronous function matching
   # `System.cmd/3`. No timeout enforcement — tests should be fast enough
   # to rely on ExUnit's own timeout.
-  defp run_injected(config, executable, args, paths) do
+  defp run_injected(config, executable, args, paths, on_chunk) do
     runner = Map.fetch!(config, :command_runner)
     opts = [cd: paths.workdir, stderr_to_stdout: true]
 
     case runner.(executable, args, opts) do
       {output, status} when is_binary(output) and is_integer(status) ->
-        {:ok, %{output: output, status: status}}
+        {_rest, streamed} = stream_output(output <> "\n", {"", false}, on_chunk)
+        {:ok, %{output: output, status: status, streamed_reply: streamed}}
 
       other ->
         {:error, "codex exec returned unexpected result: #{inspect(other)}"}
@@ -333,7 +365,7 @@ defmodule Alloy.Provider.Codex do
   # replace itself with env, which replaces itself with codex — so
   # `Port.info(:os_pid)` returns codex's own pid rather than a shell pid
   # whose children we'd otherwise orphan.
-  defp run_port(executable, args, paths, timeout) do
+  defp run_port(executable, args, paths, timeout, on_chunk) do
     shell_command = build_port_command(executable, args, paths)
 
     port =
@@ -352,10 +384,13 @@ defmodule Alloy.Provider.Codex do
     # Port.info/2 returns nil when the process already exited — its output
     # and exit_status messages are still in the mailbox, so collect them;
     # there is just no OS pid left to kill on timeout.
-    case Port.info(port, :os_pid) do
-      {:os_pid, os_pid} -> collect_port(port, os_pid, timeout, [])
-      nil -> collect_port(port, nil, timeout, [])
-    end
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, os_pid} -> os_pid
+        nil -> nil
+      end
+
+    collect_port(port, os_pid, timeout, {[], {"", false}}, on_chunk)
   rescue
     error in ErlangError ->
       {:error, "codex exec failed to start: #{Exception.message(error)}"}
@@ -375,18 +410,71 @@ defmodule Alloy.Provider.Codex do
       shell_escape(paths.prompt_path)
   end
 
-  defp collect_port(port, os_pid, timeout, acc) do
+  defp collect_port(port, os_pid, timeout, {acc, stream}, on_chunk) do
     receive do
       {^port, {:data, data}} when is_binary(data) ->
-        collect_port(port, os_pid, timeout, [acc, data])
+        collect_port(
+          port,
+          os_pid,
+          timeout,
+          {[acc, data], stream_output(data, stream, on_chunk)},
+          on_chunk
+        )
 
       {^port, {:exit_status, status}} ->
-        {:ok, %{output: IO.iodata_to_binary(acc), status: status}}
+        {_rest, streamed} = stream_output("\n", stream, on_chunk)
+        {:ok, %{output: IO.iodata_to_binary(acc), status: status, streamed_reply: streamed}}
     after
       timeout ->
         _ = kill_os_process(os_pid)
         _ = close_and_drain(port)
         {:error, "codex exec timed out after #{timeout}ms"}
+    end
+  end
+
+  # `--json` events, handed on as each line completes: a message when Codex
+  # finishes writing it, a shell command when it starts. The state is the
+  # partial line so far and whether the turn's structured reply went out, in
+  # which case `stream/4` does not replay it.
+  defp stream_output(_data, state, nil), do: state
+
+  defp stream_output(data, {partial, streamed}, on_chunk) do
+    [rest | lines] = Enum.reverse(String.split(partial <> data, "\n"))
+    streamed = lines |> Enum.reverse() |> Enum.reduce(streamed, &stream_event(&1, &2, on_chunk))
+    {rest, streamed}
+  end
+
+  defp stream_event(line, streamed, on_chunk) do
+    case Jason.decode(line) do
+      {:ok,
+       %{
+         "type" => "item.started",
+         "item" => %{"type" => "command_execution", "command" => command}
+       }}
+      when is_binary(command) ->
+        on_chunk.("\n$ #{command}\n")
+        streamed
+
+      {:ok, %{"type" => "item.completed", "item" => %{"type" => "agent_message", "text" => text}}}
+      when is_binary(text) ->
+        stream_message(text, streamed, on_chunk)
+
+      _ ->
+        streamed
+    end
+  end
+
+  # The last message is the structured reply, whose `text` is what the model
+  # said; anything before it is Codex narrating its own work.
+  defp stream_message(text, streamed, on_chunk) do
+    case Jason.decode(text) do
+      {:ok, %{"text" => reply}} when is_binary(reply) ->
+        if reply != "", do: on_chunk.(reply)
+        true
+
+      _ ->
+        on_chunk.(String.trim_trailing(text) <> "\n")
+        streamed
     end
   end
 
@@ -522,7 +610,10 @@ defmodule Alloy.Provider.Codex do
       stop_reason: stop_reason,
       messages: [reply],
       usage: extract_usage(events),
-      response_metadata: response_metadata(config, command_result),
+      response_metadata:
+        config
+        |> response_metadata(command_result)
+        |> Map.put(:session, session(command_result.plan, thread_id(events))),
       provider_state: CliSession.next_state(messages, reply, thread_id(events))
     }
   end
@@ -539,6 +630,11 @@ defmodule Alloy.Provider.Codex do
       end
     end)
   end
+
+  defp session({:resume, _id, _new}, thread),
+    do: %{mode: :resumed, reason: nil, thread_id: thread}
+
+  defp session({:fresh, reason}, thread), do: %{mode: :fresh, reason: reason, thread_id: thread}
 
   defp thread_id(events) do
     Enum.find_value(events, fn
@@ -783,7 +879,8 @@ defmodule Alloy.Provider.Codex do
   # Not `--ephemeral`: that stops Codex recording the thread, and the thread is
   # what gets resumed. `exec resume` has no `--sandbox`, so it goes in as a
   # config override.
-  defp exec_args(:fresh), do: ["exec", "--skip-git-repo-check", "--sandbox", "read-only"]
+  defp exec_args({:fresh, _reason}),
+    do: ["exec", "--skip-git-repo-check", "--sandbox", "read-only"]
 
   defp exec_args({:resume, _session_id, _new_messages}),
     do: ["exec", "resume", "--skip-git-repo-check", "-c", ~s(sandbox_mode="read-only")]
@@ -800,7 +897,7 @@ defmodule Alloy.Provider.Codex do
 
   # The thread id is positional, ahead of the prompt marker.
   defp maybe_append_session(args, {:resume, session_id, _new_messages}), do: args ++ [session_id]
-  defp maybe_append_session(args, :fresh), do: args
+  defp maybe_append_session(args, {:fresh, _reason}), do: args
 
   defp maybe_append_model(args, config) do
     case Map.get(config, :model) do

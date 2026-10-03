@@ -518,6 +518,70 @@ defmodule Alloy.Provider.CodexTest do
       assert List.last(fresh) =~ "Remember PLUM"
     end
 
+    test "says a resumed turn resumed, and which thread" do
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: @thread, sent_upto: 2, prefix_hash: :erlang.phash2(earlier)},
+        command_runner: fake_runner(json_reply("PLUM"))
+      }
+
+      assert {:ok, result} = Codex.complete(earlier ++ [Message.user("What?")], [], config)
+
+      assert result.response_metadata.session ==
+               %{mode: :resumed, reason: nil, thread_id: @thread}
+    end
+
+    test "says why a turn went out fresh" do
+      runner = fake_runner(json_reply("Hi"))
+      messages = [Message.user("Summary"), Message.assistant("OK"), Message.user("Go")]
+
+      first = %{model: "gpt-5.4", command_runner: runner}
+
+      rewritten =
+        %{
+          first
+          | command_runner: runner
+        }
+        |> Map.put(:provider_state, %{session_id: @thread, sent_upto: 2, prefix_hash: 0})
+
+      assert {:ok, %{response_metadata: %{session: %{mode: :fresh, reason: :no_session}}}} =
+               Codex.complete(messages, [], first)
+
+      {result, log} =
+        ExUnit.CaptureLog.with_log(fn -> Codex.complete(messages, [], rewritten) end)
+
+      assert {:ok, %{response_metadata: %{session: %{mode: :fresh, reason: :history_rewritten}}}} =
+               result
+
+      assert log =~ "starting a new thread"
+    end
+
+    test "says a turn went out fresh because its thread could not be resumed" do
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+
+      config = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: @thread, sent_upto: 2, prefix_hash: :erlang.phash2(earlier)},
+        command_runner:
+          fake_runner(fn args, opts, path ->
+            case args do
+              ["exec", "resume" | _] -> {"Error: thread not found", 1}
+              _ -> json_reply("PLUM").(args, opts, path)
+            end
+          end)
+      }
+
+      {result, _log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          Codex.complete(earlier ++ [Message.user("What?")], [], config)
+        end)
+
+      assert {:ok, %{response_metadata: %{session: %{mode: :fresh, reason: :resume_failed}}}} =
+               result
+    end
+
     defp json_reply(text) do
       fn _args, _opts, output_path ->
         File.write!(
@@ -559,6 +623,101 @@ defmodule Alloy.Provider.CodexTest do
 
       assert_receive {:chunk, "Chunk me"}
       assert result.messages == [Message.assistant("Chunk me")]
+    end
+
+    test "hands on each message and command as Codex writes it, and does not replay the reply" do
+      parent = self()
+      reply = Jason.encode!(%{stop_reason: "end_turn", text: "Rivers flow.", tool_calls: []})
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner:
+          fake_runner(fn _args, _opts, output_path ->
+            File.write!(output_path, reply)
+
+            Enum.map_join(
+              [
+                %{type: "thread.started", thread_id: "t-1"},
+                %{
+                  type: "item.completed",
+                  item: %{type: "agent_message", text: "I'll look first.\n"}
+                },
+                %{type: "item.started", item: %{type: "command_execution", command: "ls"}},
+                %{type: "item.completed", item: %{type: "agent_message", text: reply}},
+                %{type: "turn.completed", usage: %{input_tokens: 10, output_tokens: 2}}
+              ],
+              "\n",
+              &Jason.encode!/1
+            )
+          end)
+      }
+
+      assert {:ok, result} =
+               Codex.stream([Message.user("Rivers?")], [], config, fn chunk ->
+                 send(parent, {:chunk, chunk})
+                 :ok
+               end)
+
+      assert_receive {:chunk, "I'll look first.\n"}
+      assert_receive {:chunk, "\n$ ls\n"}
+      assert_receive {:chunk, "Rivers flow."}
+      refute_receive {:chunk, "Rivers flow."}
+      assert result.messages == [Message.assistant("Rivers flow.")]
+    end
+
+    # The fake codex prints its first message and then waits for a file that
+    # only the callback creates. Chunks handed on at exit would never create
+    # it, and the turn would time out instead of finishing.
+    test "hands on a message while the real process is still running" do
+      temp_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "alloy-codex-stream-test-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(temp_dir)
+      on_exit(fn -> File.rm_rf(temp_dir) end)
+
+      auth_path = Path.join(temp_dir, "auth.json")
+      File.write!(auth_path, "{}")
+      go_path = Path.join(temp_dir, "go")
+      script_path = Path.join(temp_dir, "fake-codex.sh")
+
+      File.write!(script_path, """
+      #!/bin/sh
+      output=""
+      while [ "$#" -gt 0 ]; do
+        if [ "$1" = "--output-last-message" ]; then shift; output="$1"; fi
+        shift
+      done
+      cat > /dev/null
+      printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"working on it"}}'
+      while [ ! -f "#{go_path}" ]; do sleep 0.05; done
+      printf '%s' '{"stop_reason":"end_turn","text":"done","tool_calls":[]}' > "$output"
+      printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"stop_reason\\":\\"end_turn\\",\\"text\\":\\"done\\",\\"tool_calls\\":[]}"}}'
+      """)
+
+      File.chmod!(script_path, 0o755)
+
+      config = %{
+        model: "gpt-5.4",
+        codex_bin: script_path,
+        auth_path: auth_path,
+        timeout_ms: 10_000
+      }
+
+      parent = self()
+
+      assert {:ok, result} =
+               Codex.stream([Message.user("Go")], [], config, fn chunk ->
+                 if chunk =~ "working on it", do: File.write!(go_path, "")
+                 send(parent, {:chunk, chunk})
+                 :ok
+               end)
+
+      assert_receive {:chunk, "working on it\n"}
+      assert_receive {:chunk, "done"}
+      assert result.messages == [Message.assistant("done")]
     end
   end
 
