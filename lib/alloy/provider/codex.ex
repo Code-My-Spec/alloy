@@ -17,6 +17,10 @@ defmodule Alloy.Provider.Codex do
   - `:workdir` - Directory passed to `codex exec` (defaults to a temp dir)
   - `:profile` - Optional Codex config profile
   - `:codex_home` - Override `CODEX_HOME` instead of using the isolated home
+  - `:ignore_user_config` - Pass `--ignore-user-config`: the home's
+    `config.toml` (its plugins, MCP servers, approval reviewer and default
+    model) is not loaded, while `auth.json` still is. For a shared
+    `:codex_home` that belongs to a person rather than to this provider
   - `:auth_path` - Override source `auth.json` copied into the isolated home
     (default: `~/.codex/auth.json`)
   - `:tmp_dir` - Parent for the provider's temp working directory and the
@@ -118,6 +122,7 @@ defmodule Alloy.Provider.Codex do
           optional(:workdir) => String.t(),
           optional(:profile) => String.t(),
           optional(:codex_home) => String.t(),
+          optional(:ignore_user_config) => boolean(),
           optional(:auth_path) => String.t(),
           optional(:tmp_dir) => String.t(),
           optional(:timeout_ms) => pos_integer(),
@@ -345,6 +350,7 @@ defmodule Alloy.Provider.Codex do
       ])
       |> maybe_append_profile(config)
       |> maybe_append_model(config)
+      |> maybe_ignore_user_config(config)
       |> maybe_append_session(plan)
       |> append_prompt_arg(prompt, config)
 
@@ -929,6 +935,13 @@ defmodule Alloy.Provider.Codex do
   # The thread id is positional, ahead of the prompt marker.
   defp maybe_append_session(args, {:resume, session_id, _new_messages}), do: args ++ [session_id]
   defp maybe_append_session(args, {:fresh, _reason}), do: args
+
+  # Both `exec` and `exec resume` take it, so a resumed turn runs under the
+  # same configuration as the one that started the thread.
+  defp maybe_ignore_user_config(args, %{ignore_user_config: true}),
+    do: args ++ ["--ignore-user-config"]
+
+  defp maybe_ignore_user_config(args, _config), do: args
 
   defp maybe_append_model(args, config) do
     case Map.get(config, :model) do

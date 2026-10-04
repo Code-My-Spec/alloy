@@ -441,6 +441,38 @@ defmodule Alloy.Provider.CodexTest do
              }
     end
 
+    test "ignores the home's config.toml on fresh and resumed turns when asked" do
+      parent = self()
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:args, args})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      config = %{model: "gpt-5.4", command_runner: runner, ignore_user_config: true}
+      assert {:ok, _} = Codex.complete(earlier, [], config)
+      assert_receive {:args, ["exec", "--skip-git-repo-check" | _] = fresh}
+      assert "--ignore-user-config" in fresh
+
+      resumed =
+        Map.put(config, :provider_state, %{
+          session_id: @thread,
+          sent_upto: 2,
+          prefix_hash: :erlang.phash2(earlier)
+        })
+
+      assert {:ok, _} = Codex.complete(earlier ++ [Message.user("What?")], [], resumed)
+      assert_receive {:args, ["exec", "resume" | _] = resume}
+      assert "--ignore-user-config" in resume
+      assert Enum.at(resume, -2) == @thread
+
+      assert {:ok, _} = Codex.complete(earlier, [], Map.delete(config, :ignore_user_config))
+      assert_receive {:args, plain}
+      refute "--ignore-user-config" in plain
+    end
+
     test "a resumed turn sends the tool list only when it changed" do
       parent = self()
       earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
