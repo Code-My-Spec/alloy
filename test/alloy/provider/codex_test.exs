@@ -436,8 +436,51 @@ defmodule Alloy.Provider.CodexTest do
       assert result.provider_state == %{
                session_id: @thread,
                sent_upto: 2,
-               prefix_hash: :erlang.phash2(prefix)
+               prefix_hash: :erlang.phash2(prefix),
+               tools_hash: :erlang.phash2([])
              }
+    end
+
+    test "a resumed turn sends the tool list only when it changed" do
+      parent = self()
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+      messages = earlier ++ [Message.user("What was it?")]
+      tools = [%{name: "read_file", description: "Read a file", input_schema: %{type: "object"}}]
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:prompt, List.last(args)})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      state = %{session_id: @thread, sent_upto: 2, prefix_hash: :erlang.phash2(earlier)}
+
+      # The first turn's full prompt carried these tools, so the thread has them.
+      assert {:ok, first} =
+               Codex.complete([Message.user("Hi")], tools, %{
+                 model: "gpt-5.4",
+                 command_runner: runner
+               })
+
+      assert_receive {:prompt, _fresh}
+      known = first.provider_state.tools_hash
+
+      unchanged = %{
+        model: "gpt-5.4",
+        command_runner: runner,
+        provider_state: Map.put(state, :tools_hash, known)
+      }
+
+      assert {:ok, _} = Codex.complete(messages, tools, unchanged)
+      assert_receive {:prompt, resumed}
+      refute resumed =~ "available_tools"
+      assert resumed =~ "What was it?"
+
+      changed = %{unchanged | provider_state: Map.put(state, :tools_hash, :erlang.phash2([]))}
+      assert {:ok, _} = Codex.complete(messages, tools, changed)
+      assert_receive {:prompt, resent}
+      assert resent =~ "available_tools"
+      assert resent =~ "read_file"
     end
 
     test "resumes the thread and sends only the messages it has not seen" do
