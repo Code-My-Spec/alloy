@@ -19,6 +19,7 @@ defmodule Alloy.Tool.Executor do
   alias Alloy.Middleware
   alias Alloy.Tool.Inline
   alias Alloy.Tool.Registry
+  alias Alloy.Tool.Spill
 
   require Logger
 
@@ -38,6 +39,7 @@ defmodule Alloy.Tool.Executor do
       tool_fns: tool_fns,
       context: build_context(state),
       timeout: state.config.tool_timeout,
+      spill: state.config.tool_result_spill,
       on_event: Keyword.get(opts, :on_event, fn _ -> :ok end),
       seq_ref: Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false)),
       corr_id: Keyword.get(opts, :event_correlation_id, random_id()),
@@ -213,7 +215,7 @@ defmodule Alloy.Tool.Executor do
     with {:ok, tool} <- fetch_tool(run.tool_fns, call[:name]),
          input = call[:input] || %{},
          :ok <- check_input(input, tool) do
-      execute_tool(tool, input, call, run.context)
+      execute_tool(tool, input, call, run)
     end
   end
 
@@ -252,10 +254,10 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  defp execute_tool(%Inline{execute: execute} = tool, input, call, context) do
-    case execute.(input, context) do
-      {:ok, text, data} when is_map(data) -> {:ok, maybe_truncate(text, tool), data}
-      {:ok, text} -> {:ok, maybe_truncate(text, tool), nil}
+  defp execute_tool(%Inline{execute: execute} = tool, input, call, run) do
+    case execute.(input, run.context) do
+      {:ok, text, data} when is_map(data) -> {:ok, shape(text, tool, run.spill, call), data}
+      {:ok, text} -> {:ok, shape(text, tool, run.spill, call), nil}
       {:error, reason} -> {:error, reason, nil}
     end
   rescue
@@ -376,6 +378,27 @@ defmodule Alloy.Tool.Executor do
   defp maybe_put_structured_data(meta, data), do: Map.put(meta, :structured_data, data)
 
   defp random_id, do: "run_" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+
+  # Spilled to a file when that is configured and the result is over its
+  # threshold; otherwise truncated as the tool asks. A tool that declared
+  # itself `:unlimited` is never cut either way.
+  defp shape(text, %Inline{max_result_chars: :unlimited}, _spill, _call), do: text
+
+  defp shape(text, tool, spill, call) when is_binary(text) and is_map(spill) do
+    case Spill.spill(text, spill, call[:name], call[:id]) do
+      {:spilled, notice} ->
+        notice
+
+      :keep ->
+        maybe_truncate(text, tool)
+
+      {:error, reason} ->
+        Logger.warning("Alloy could not spill #{call[:name]}'s result: #{inspect(reason)}")
+        maybe_truncate(text, tool)
+    end
+  end
+
+  defp shape(text, tool, _spill, _call), do: maybe_truncate(text, tool)
 
   defp maybe_truncate(text, %Inline{max_result_chars: max_result_chars}) when is_binary(text) do
     case max_result_chars do

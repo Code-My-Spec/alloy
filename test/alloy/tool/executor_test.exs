@@ -3,7 +3,7 @@ defmodule Alloy.Tool.ExecutorTest do
 
   alias Alloy.Agent.{Config, State}
   alias Alloy.Message
-  alias Alloy.Tool.Executor
+  alias Alloy.Tool.{Executor, Spill}
 
   # --- Test Tool Modules ---
 
@@ -796,7 +796,8 @@ defmodule Alloy.Tool.ExecutorTest do
       middleware: Keyword.get(opts, :middleware, []),
       working_directory: Keyword.get(opts, :working_directory, "."),
       context: Keyword.get(opts, :context, %{}),
-      tool_timeout: Keyword.get(opts, :tool_timeout, 120_000)
+      tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
+      tool_result_spill: Keyword.get(opts, :tool_result_spill)
     }
 
     State.init(config)
@@ -941,6 +942,91 @@ defmodule Alloy.Tool.ExecutorTest do
       assert String.length(block.content) == 500
     end
   end
+
+  defmodule LongTool do
+    @behaviour Alloy.Tool
+    def name, do: "long"
+    def description, do: "Returns numbered lines and an exit code"
+    def input_schema, do: %{type: "object", properties: %{}}
+    def max_result_chars, do: 30_000
+
+    def execute(_input, _ctx),
+      do: {:ok, Enum.map_join(1..4_000, "\n", &"line #{&1}") <> "\nexit code: 1"}
+  end
+
+  describe "execute_all — tool_result_spill" do
+    @describetag :tmp_dir
+
+    test "a result over the threshold is written whole, with a notice in its place",
+         %{tmp_dir: dir} do
+      state = build_state([LongTool], tool_result_spill: spill(dir))
+      call = %{id: "call/1", name: "long", type: "tool_use", input: %{}}
+      {:ok, full} = LongTool.execute(%{}, %{})
+
+      %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+
+      path = Path.join(dir, "long-call_1.txt")
+      assert File.read!(path) == full
+      assert block.content =~ "Full output saved to: #{path}"
+      assert block.content =~ "line 1\nline 2\n"
+      assert String.ends_with?(block.content, "line 4000\nexit code: 1")
+      # The notice names the path, whose length depends on where the tests run.
+      assert block.content |> String.replace(path, "") |> String.length() < 3_500
+    end
+
+    test "a result within the threshold is left to the tool's own cap", %{tmp_dir: dir} do
+      state =
+        build_state([VerboseTool],
+          tool_result_spill: spill(dir, threshold: 1_000, preview_chars: 200, tail_chars: 100)
+        )
+
+      call = %{id: "c1", name: "verbose", type: "tool_use", input: %{}}
+
+      %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+
+      assert block.content =~ "[truncated"
+      assert File.ls!(dir) == []
+    end
+
+    test "an :unlimited tool is never spilled", %{tmp_dir: dir} do
+      state =
+        build_state([UnlimitedTool],
+          tool_result_spill: spill(dir, threshold: 200, preview_chars: 50, tail_chars: 50)
+        )
+
+      call = %{id: "c1", name: "unlimited", type: "tool_use", input: %{}}
+
+      %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+
+      assert block.content == String.duplicate("y", 500)
+      assert File.ls!(dir) == []
+    end
+
+    test "an unwritable directory falls back to truncation", %{tmp_dir: dir} do
+      blocker = Path.join(dir, "file")
+      File.write!(blocker, "")
+      state = build_state([LongTool], tool_result_spill: spill(Path.join(blocker, "sub")))
+      call = %{id: "c1", name: "long", type: "tool_use", input: %{}}
+
+      {%Message{content: [block]}, log} =
+        ExUnit.CaptureLog.with_log(fn -> Executor.execute_all([call], state.tool_fns, state) end)
+
+      refute block.content =~ "Full output saved"
+      assert block.content =~ "[truncated"
+      assert log =~ "could not spill"
+    end
+
+    test "without the option nothing is spilled" do
+      state = build_state([LongTool])
+      call = %{id: "c1", name: "long", type: "tool_use", input: %{}}
+
+      %Message{content: [block]} = Executor.execute_all([call], state.tool_fns, state)
+
+      refute block.content =~ "Full output saved"
+    end
+  end
+
+  defp spill(dir, opts \\ []), do: Spill.normalize([dir: dir] ++ opts, ".")
 
   describe "execute_all — cancellation" do
     # Server.cancel_request kills the turn outright; tool tasks are unlinked

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`:tool_result_spill`** (opt-in, on `Alloy.Agent.Config`): a tool result
+  longer than `:threshold` characters (default 10,000) is written whole to a
+  file under `:dir`, and the model gets a notice with the path, the first
+  `:preview_chars` and the last `:tail_chars`, so it can read the rest instead
+  of losing it to truncation. Tools that declare `max_result_chars: :unlimited`
+  are never spilled, and a failed write falls back to truncation. The bash
+  tool still bounds its output while the command runs, so a spilled bash
+  result holds the first 8 KB and last 20 KB.
+
 ## [0.12.5] - 2026-10-09
 
 ### Security
