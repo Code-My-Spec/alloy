@@ -2,8 +2,8 @@ defmodule Alloy.Tool.Core.Bash do
   @moduledoc """
   Built-in tool: execute shell commands via `bash -rc` (restricted shell).
 
-  Returns stdout/stderr merged with the exit code appended. Output is
-  truncated at 30,000 characters to prevent context overflow.
+  Returns stdout/stderr merged with the exit code appended. The executor caps
+  it at `max_result_chars/0`.
   Commands that exceed the timeout are killed and return an error.
 
   ## Security
@@ -41,7 +41,6 @@ defmodule Alloy.Tool.Core.Bash do
   @type executor :: (command :: String.t(), dir :: String.t() -> {String.t(), non_neg_integer()})
 
   @default_timeout 10_000
-  @max_output 30_000
 
   @impl true
   def name, do: "bash"
@@ -99,7 +98,7 @@ defmodule Alloy.Tool.Core.Bash do
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
       {:ok, {output, exit_code}} ->
-        {:ok, "#{truncate(output)}\nexit code: #{exit_code}"}
+        {:ok, "#{output}\nexit code: #{exit_code}"}
 
       {:exit, reason} ->
         {:error, "Executor crashed: #{inspect(reason)}"}
@@ -118,7 +117,7 @@ defmodule Alloy.Tool.Core.Bash do
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
       {:ok, {output, exit_code}} ->
-        {:ok, "#{truncate(output)}\nexit code: #{exit_code}"}
+        {:ok, "#{output}\nexit code: #{exit_code}"}
 
       {:exit, reason} ->
         {:error, "Executor crashed: #{inspect(reason)}"}
@@ -133,10 +132,4 @@ defmodule Alloy.Tool.Core.Bash do
 
   defp normalize_timeout(timeout) when is_integer(timeout) and timeout > 0, do: timeout
   defp normalize_timeout(_timeout), do: @default_timeout
-
-  defp truncate(output) when byte_size(output) > @max_output do
-    String.slice(output, 0, @max_output) <> "\n... (output truncated)"
-  end
-
-  defp truncate(output), do: output
 end

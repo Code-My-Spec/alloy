@@ -57,15 +57,14 @@ defmodule Alloy.Tool.Core.BashTest do
       assert result =~ tmp_dir
     end
 
-    test "truncates output beyond 30000 chars", %{tmp_dir: tmp_dir} do
-      # Generate output longer than 30000 chars
+    test "returns all of a long output; the executor applies the cap", %{tmp_dir: tmp_dir} do
       cmd = "python3 -c \"print('x' * 40000)\""
 
       assert {:ok, result} =
                Bash.execute(%{"command" => cmd}, %{working_directory: tmp_dir})
 
-      assert String.length(result) <= 31_000
-      assert result =~ "truncated"
+      assert result == String.duplicate("x", 40_000) <> "\n\nexit code: 0"
+      assert Bash.max_result_chars() == 30_000
     end
 
     test "enforces timeout with a descriptive message", %{tmp_dir: tmp_dir} do
@@ -151,7 +150,7 @@ defmodule Alloy.Tool.Core.BashTest do
       assert msg =~ "timed out"
     end
 
-    test "custom executor output is truncated when over 30000 chars" do
+    test "custom executor output comes back whole" do
       big_output = String.duplicate("x", 40_000)
       executor = fn _command, _working_dir -> {big_output, 0} end
 
@@ -161,8 +160,7 @@ defmodule Alloy.Tool.Core.BashTest do
                  %{bash_executor: executor}
                )
 
-      assert String.length(result) <= 31_000
-      assert result =~ "truncated"
+      assert result == big_output <> "\nexit code: 0"
     end
   end
 end

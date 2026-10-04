@@ -12,6 +12,7 @@ defmodule Alloy.Tool.Executor do
   alias Alloy.Middleware
   alias Alloy.Tool.Inline
   alias Alloy.Tool.Registry
+  alias Alloy.Tool.Spill
 
   require Logger
 
@@ -29,7 +30,7 @@ defmodule Alloy.Tool.Executor do
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
     context = build_context(state)
     tool_timeout = state.config.tool_timeout
-    unknown_tool = state.config.unknown_tool
+    shaping = %{unknown_tool: state.config.unknown_tool, spill: state.config.tool_result_spill}
     on_event = Keyword.get(opts, :on_event, fn _ -> :ok end)
     seq_ref = Keyword.get(opts, :event_seq_ref, :atomics.new(1, signed: false))
     corr_id = Keyword.get(opts, :event_correlation_id, random_id())
@@ -45,7 +46,7 @@ defmodule Alloy.Tool.Executor do
         # Phase 1: Non-concurrent tools run sequentially
         seq_results =
           Enum.map(sequential, fn tag ->
-            run_tagged(tag, tool_fns, context, unknown_tool, on_event, seq_ref, corr_id, turn)
+            run_tagged(tag, tool_fns, context, shaping, on_event, seq_ref, corr_id, turn)
           end)
 
         # Phase 2: Concurrent tools run in parallel
@@ -56,7 +57,7 @@ defmodule Alloy.Tool.Executor do
             Task.Supervisor.async_stream(
               Alloy.TaskSupervisor,
               concurrent,
-              &run_tagged(&1, tool_fns, context, unknown_tool, on_event, seq_ref, corr_id, turn),
+              &run_tagged(&1, tool_fns, context, shaping, on_event, seq_ref, corr_id, turn),
               timeout: tool_timeout,
               ordered: true,
               on_timeout: :kill_task
@@ -96,7 +97,7 @@ defmodule Alloy.Tool.Executor do
     end
   end
 
-  defp run_tagged({:execute, call}, fns, ctx, unknown_tool, on_event, seq_ref, corr_id, turn) do
+  defp run_tagged({:execute, call}, fns, ctx, shaping, on_event, seq_ref, corr_id, turn) do
     t0 = System.monotonic_time(:millisecond)
     sseq = emit_start(on_event, call, seq_ref, corr_id, turn)
     block_fn = result_block_fn(call[:type])
@@ -107,10 +108,10 @@ defmodule Alloy.Tool.Executor do
           try do
             case tool_execute(tool, call[:input] || %{}, ctx) do
               {:ok, text, data} when is_map(data) ->
-                {block_fn.(call[:id], maybe_truncate(text, tool), false), nil, data}
+                {block_fn.(call[:id], shape(text, tool, shaping.spill, call), false), nil, data}
 
               {:ok, r} ->
-                {block_fn.(call[:id], maybe_truncate(r, tool), false), nil, nil}
+                {block_fn.(call[:id], shape(r, tool, shaping.spill, call), false), nil, nil}
 
               {:error, r} ->
                 {block_fn.(call[:id], r, true), r, nil}
@@ -129,7 +130,7 @@ defmodule Alloy.Tool.Executor do
           end
 
         :error ->
-          err = unknown_tool_message(unknown_tool, call[:name])
+          err = unknown_tool_message(shaping.unknown_tool, call[:name])
           {block_fn.(call[:id], err, true), err, nil}
       end
 
@@ -294,6 +295,32 @@ defmodule Alloy.Tool.Executor do
 
   defp tool_sequential?(mod) do
     function_exported?(mod, :concurrent?, 0) and mod.concurrent?() == false
+  end
+
+  # Spilled to a file when that is configured and the result is over its
+  # threshold; otherwise truncated as the tool asks. A tool that declared
+  # itself `:unlimited` is never cut either way.
+  defp shape(text, tool, spill, call) when is_binary(text) and is_map(spill) do
+    case tool_max_result_chars(tool) do
+      :unlimited -> text
+      _ -> spill_or_truncate(text, tool, spill, call)
+    end
+  end
+
+  defp shape(text, tool, _spill, _call), do: maybe_truncate(text, tool)
+
+  defp spill_or_truncate(text, tool, spill, call) do
+    case Spill.spill(text, spill, call[:name], call[:id]) do
+      {:spilled, notice} ->
+        notice
+
+      :keep ->
+        maybe_truncate(text, tool)
+
+      {:error, reason} ->
+        Logger.warning("Alloy could not spill #{call[:name]}'s result: #{inspect(reason)}")
+        maybe_truncate(text, tool)
+    end
   end
 
   defp maybe_truncate(text, tool) when is_binary(text) do

@@ -8,6 +8,7 @@ defmodule Alloy.Agent.Config do
 
   alias Alloy.Context.Compactor
   alias Alloy.ModelMetadata
+  alias Alloy.Tool.Spill
 
   @type compaction :: %{
           reserve_tokens: pos_integer(),
@@ -50,6 +51,7 @@ defmodule Alloy.Agent.Config do
             keep_recent_tokens: boolean()
           },
           working_directory: String.t(),
+          tool_result_spill: Spill.t() | nil,
           context: map(),
           # Accepts any session-shaped struct (%Alloy.Session{} or
           # %AlloyAgent.Session{}) — see issue #40.
@@ -93,6 +95,7 @@ defmodule Alloy.Agent.Config do
     },
     compaction_explicit: %{reserve_tokens: false, keep_recent_tokens: false},
     working_directory: ".",
+    tool_result_spill: nil,
     context: %{},
     on_shutdown: nil,
     on_compaction: nil,
@@ -150,6 +153,11 @@ defmodule Alloy.Agent.Config do
       compaction: compaction,
       compaction_explicit: compaction_explicit,
       working_directory: Keyword.get(opts, :working_directory, "."),
+      tool_result_spill:
+        Spill.normalize(
+          Keyword.get(opts, :tool_result_spill),
+          Keyword.get(opts, :working_directory, ".")
+        ),
       context: Keyword.get(opts, :context, %{}),
       on_shutdown: Keyword.get(opts, :on_shutdown, nil),
       on_compaction: Keyword.get(opts, :on_compaction, nil),
