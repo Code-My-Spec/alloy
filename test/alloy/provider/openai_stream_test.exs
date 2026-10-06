@@ -213,6 +213,33 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       assert tool.input == %{"file_path" => "mix.exs"}
     end
 
+    test "keeps text and finish_reason when chunks carry tool_calls: null (DeepInfra)" do
+      chunk = fn content, finish ->
+        %{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{"content" => content, "tool_calls" => nil},
+              "finish_reason" => finish
+            }
+          ]
+        }
+      end
+
+      chunks = [
+        sse_chunk(chunk.("Hello", nil)),
+        sse_chunk(chunk.(" world", nil)),
+        sse_chunk(chunk.("", "stop")),
+        sse_done()
+      ]
+
+      {_collected, result} = collect_stream(chunks, test_name: :text_null_tool_calls)
+
+      assert {:ok, response} = result
+      assert response.stop_reason == :end_turn
+      assert [%Message{content: [%{type: "text", text: "Hello world"}]}] = response.messages
+    end
+
     test "handles multiple tool calls in same stream" do
       chunks = [
         sse_chunk(tool_call_start(0, "call_1", "read")),
