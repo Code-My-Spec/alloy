@@ -167,6 +167,52 @@ defmodule Alloy.Provider.OpenAIStreamTest do
       assert tool.input == %{"file_path" => "mix.exs"}
     end
 
+    test "keeps the id when later chunks repeat it as null (DeepInfra)" do
+      args = fn text ->
+        %{
+          "choices" => [
+            %{
+              "index" => 0,
+              "delta" => %{
+                "content" => "",
+                "tool_calls" => [
+                  %{"index" => 0, "id" => nil, "function" => %{"arguments" => text}}
+                ]
+              },
+              "finish_reason" => nil
+            }
+          ]
+        }
+      end
+
+      null_tool_calls = %{
+        "choices" => [
+          %{
+            "index" => 0,
+            "delta" => %{"content" => "", "tool_calls" => nil},
+            "finish_reason" => nil
+          }
+        ]
+      }
+
+      chunks = [
+        sse_chunk(null_tool_calls),
+        sse_chunk(tool_call_start(0, "chatcmpl-tool-abc", "read")),
+        sse_chunk(args.("{\"file_path\":")),
+        sse_chunk(args.("\"mix.exs\"}")),
+        sse_chunk(finish_chunk("tool_calls")),
+        sse_done()
+      ]
+
+      {_collected, result} = collect_stream(chunks, test_name: :tool_null_id)
+
+      assert {:ok, response} = result
+      assert [%Message{content: blocks}] = response.messages
+      tool = Enum.find(blocks, &(&1.type == "tool_use"))
+      assert tool.id == "chatcmpl-tool-abc"
+      assert tool.input == %{"file_path" => "mix.exs"}
+    end
+
     test "handles multiple tool calls in same stream" do
       chunks = [
         sse_chunk(tool_call_start(0, "call_1", "read")),
