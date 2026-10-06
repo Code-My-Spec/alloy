@@ -150,6 +150,8 @@ defmodule Alloy.Provider.OpenAIStream do
 
   # ── Tool Call Accumulation ───────────────────────────────────────────
 
+  # DeepInfra sends "tool_calls": null on chunks without a call.
+  defp accumulate_tool_calls(acc, nil), do: acc
   defp accumulate_tool_calls(acc, []), do: acc
 
   defp accumulate_tool_calls(acc, tool_call_deltas) do
