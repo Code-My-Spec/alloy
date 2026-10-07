@@ -195,7 +195,8 @@ defmodule Alloy.Provider.Codex do
          {:ok, payload} <- read_turn_payload(plan, paths.last_message_path, command_result),
          {:ok, result} <-
            parse_payload(payload, config, Map.put(command_result, :plan, plan), messages) do
-      {:ok, remember_tools(result, tool_defs), command_result.streamed_reply}
+      {:ok, result |> remember_tools(tool_defs) |> remember_system(config),
+       command_result.streamed_reply}
     else
       {:resume_failed, session_id, reason} ->
         Logger.warning(
@@ -227,9 +228,11 @@ defmodule Alloy.Provider.Codex do
     do: read_payload_or_error(path, command_result)
 
   defp build_turn_prompt({:resume, _session_id, new_messages}, _messages, tool_defs, config) do
-    known = (Map.get(config, :provider_state) || %{}) |> Map.get(:tools_hash)
-    changed = if known == tools_hash(tool_defs), do: nil, else: tool_defs
-    build_incremental_prompt(new_messages, changed)
+    state = Map.get(config, :provider_state) || %{}
+    changed = if Map.get(state, :tools_hash) == tools_hash(tool_defs), do: nil, else: tool_defs
+    system = Map.get(config, :system_prompt)
+    system = if Map.get(state, :system_hash) == :erlang.phash2(system), do: nil, else: system
+    build_incremental_prompt(new_messages, changed, system)
   end
 
   defp build_turn_prompt({:fresh, _reason}, messages, tool_defs, config),
@@ -247,6 +250,16 @@ defmodule Alloy.Provider.Codex do
     do: %{completion | provider_state: Map.put(state, :tools_hash, nil)}
 
   defp remember_tools(completion, _tool_defs), do: completion
+
+  # Same for the system prompt: a brief changed after the thread began never
+  # reached it, because a resume sent only new messages.
+  defp remember_system(%{provider_state: %{} = state} = completion, config),
+    do: %{
+      completion
+      | provider_state: Map.put(state, :system_hash, :erlang.phash2(config[:system_prompt]))
+    }
+
+  defp remember_system(completion, _config), do: completion
 
   defp tools_hash(tool_defs), do: :erlang.phash2(Enum.map(tool_defs, &serialize_tool_def/1))
 
@@ -885,10 +898,11 @@ defmodule Alloy.Provider.Codex do
   # Sent instead of `build_prompt/3` when resuming: the thread already holds the
   # framing, the response rules and every earlier message. Tool definitions go
   # in only when they changed (`tool_defs` nil otherwise).
-  defp build_incremental_prompt(new_messages, tool_defs) do
+  defp build_incremental_prompt(new_messages, tool_defs, system_prompt) do
     payload =
       %{conversation: Enum.map(new_messages, &serialize_message/1)}
       |> put_tools(tool_defs)
+      |> put_system_prompt(system_prompt)
 
     """
     Continuing the same conversation. Produce exactly one JSON object
@@ -899,6 +913,10 @@ defmodule Alloy.Provider.Codex do
     #{Jason.encode!(payload)}
     """
   end
+
+  # A changed system prompt replaces the one the thread started with.
+  defp put_system_prompt(payload, nil), do: payload
+  defp put_system_prompt(payload, prompt), do: Map.put(payload, :system_prompt, prompt)
 
   defp put_tools(payload, nil), do: payload
 

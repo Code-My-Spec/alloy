@@ -463,7 +463,8 @@ defmodule Alloy.Provider.CodexTest do
                session_id: @thread,
                sent_upto: 2,
                prefix_hash: :erlang.phash2(prefix),
-               tools_hash: :erlang.phash2([])
+               tools_hash: :erlang.phash2([]),
+               system_hash: :erlang.phash2(nil)
              }
     end
 
@@ -539,6 +540,45 @@ defmodule Alloy.Provider.CodexTest do
       assert_receive {:prompt, resent}
       assert resent =~ "available_tools"
       assert resent =~ "read_file"
+    end
+
+    test "a resumed turn sends the system prompt only when it changed" do
+      parent = self()
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+      messages = earlier ++ [Message.user("What was it?")]
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:prompt, List.last(args)})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      assert {:ok, first} =
+               Codex.complete([Message.user("Hi")], [], %{
+                 model: "gpt-5.4",
+                 system_prompt: "Brief v1",
+                 command_runner: runner
+               })
+
+      assert_receive {:prompt, _fresh}
+
+      state =
+        Map.merge(first.provider_state, %{sent_upto: 2, prefix_hash: :erlang.phash2(earlier)})
+
+      same = %{
+        model: "gpt-5.4",
+        system_prompt: "Brief v1",
+        command_runner: runner,
+        provider_state: state
+      }
+
+      assert {:ok, _} = Codex.complete(messages, [], same)
+      assert_receive {:prompt, resumed}
+      refute resumed =~ "Brief v1"
+
+      assert {:ok, _} = Codex.complete(messages, [], %{same | system_prompt: "Brief v2"})
+      assert_receive {:prompt, resent}
+      assert resent =~ "Brief v2"
     end
 
     test "resumes the thread and sends only the messages it has not seen" do
