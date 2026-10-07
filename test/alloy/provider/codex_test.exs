@@ -564,6 +564,34 @@ defmodule Alloy.Provider.CodexTest do
       assert List.last(args) =~ "Compacted summary"
     end
 
+    test "codex runs no command of its own, fresh or resumed" do
+      parent = self()
+      earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
+
+      runner =
+        fake_runner(fn args, opts, path ->
+          send(parent, {:args, args})
+          json_reply("PLUM").(args, opts, path)
+        end)
+
+      assert {:ok, _} = Codex.complete(earlier, [], %{model: "gpt-5.4", command_runner: runner})
+
+      resumed = %{
+        model: "gpt-5.4",
+        provider_state: %{session_id: @thread, sent_upto: 2, prefix_hash: :erlang.phash2(earlier)},
+        command_runner: runner
+      }
+
+      assert {:ok, _} = Codex.complete(earlier ++ [Message.user("What?")], [], resumed)
+
+      assert_receive {:args, ["exec", "--skip-git-repo-check" | _] = fresh}
+      assert_receive {:args, ["exec", "resume" | _] = resume}
+
+      for args <- [fresh, resume], feature <- ["shell_tool", "unified_exec"] do
+        assert feature in disabled(args), "codex kept #{feature} in #{inspect(args)}"
+      end
+    end
+
     test "falls back to the full transcript when the thread cannot be resumed" do
       parent = self()
       earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
@@ -839,5 +867,14 @@ defmodule Alloy.Provider.CodexTest do
   defp output_path!(args) do
     index = Enum.find_index(args, &(&1 == "--output-last-message"))
     Enum.at(args, index + 1)
+  end
+
+  defp disabled(args) do
+    args
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.flat_map(fn
+      ["--disable", feature] -> [feature]
+      _ -> []
+    end)
   end
 end

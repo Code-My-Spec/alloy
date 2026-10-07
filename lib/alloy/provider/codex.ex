@@ -79,6 +79,11 @@ defmodule Alloy.Provider.Codex do
   @default_timeout_ms 120_000
   @default_codex_bin "codex"
   @output_truncation 4_000
+
+  # Codex is the model here; the outer loop's tools run the commands. Left on,
+  # its own shell answered for them inside the read-only sandbox: `mix test`
+  # died on `:eperm` and the outer loop never saw a tool call.
+  @no_own_commands ["--disable", "shell_tool", "--disable", "unified_exec"]
   @error_truncation 2_000
   @zero_usage %{input_tokens: 0, output_tokens: 0}
 
@@ -917,10 +922,12 @@ defmodule Alloy.Provider.Codex do
   # what gets resumed. `exec resume` has no `--sandbox`, so it goes in as a
   # config override.
   defp exec_args({:fresh, _reason}),
-    do: ["exec", "--skip-git-repo-check", "--sandbox", "read-only"]
+    do: ["exec", "--skip-git-repo-check", "--sandbox", "read-only"] ++ @no_own_commands
 
   defp exec_args({:resume, _session_id, _new_messages}),
-    do: ["exec", "resume", "--skip-git-repo-check", "-c", ~s(sandbox_mode="read-only")]
+    do:
+      ["exec", "resume", "--skip-git-repo-check", "-c", ~s(sandbox_mode="read-only")] ++
+        @no_own_commands
 
   # Fresh turns only: `exec resume` has no `--profile` (codex-cli 0.157.1).
   defp maybe_append_profile(["exec", "resume" | _] = args, _config), do: args
