@@ -186,6 +186,32 @@ defmodule Alloy.Provider.CodexTest do
       assert reason =~ "arguments_json"
     end
 
+    test "a raw newline inside an arguments_json string is read as an escaped one" do
+      script = "local a = 1\nreturn a"
+      raw = ~s({"script":") <> script <> ~s("})
+
+      config = %{
+        model: "gpt-5.4",
+        command_runner:
+          fake_runner(fn _args, _opts, output_path ->
+            payload = %{
+              stop_reason: "tool_use",
+              text: "",
+              tool_calls: [%{call_id: "call_1", name: "run_script", arguments_json: raw}]
+            }
+
+            File.write!(output_path, Jason.encode!(payload))
+            "codex\n#{Jason.encode!(payload)}\n"
+          end)
+      }
+
+      assert {:ok, %{messages: [%Message{content: blocks}]}} =
+               Codex.complete([Message.user("Hi")], [], config)
+
+      assert [%{type: "tool_use", input: %{"script" => ^script}}] =
+               Enum.filter(blocks, &match?(%{type: "tool_use"}, &1))
+    end
+
     test "accepts a parsed payload even if codex exits non-zero" do
       config = %{
         model: "gpt-5.4",

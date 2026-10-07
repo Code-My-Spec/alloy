@@ -783,7 +783,7 @@ defmodule Alloy.Provider.Codex do
         ok
 
       {:error, %Jason.DecodeError{}} ->
-        case json |> repair_backslash_escapes() |> Jason.decode() do
+        case json |> repair_backslash_escapes() |> escape_raw_controls() |> Jason.decode() do
           {:ok, _} = ok ->
             ok
 
@@ -799,6 +799,33 @@ defmodule Alloy.Provider.Codex do
   defp repair_backslash_escapes(json) do
     Regex.replace(@invalid_json_escape_re, json, fn match -> "\\" <> match end)
   end
+
+  # Codex also writes multi-line scripts into a JSON string with raw newlines
+  # (`unexpected byte ... 0xA`), which failed the whole turn. Inside a string
+  # they can only mean the escaped character; outside one they are whitespace
+  # and stay as they are.
+  defp escape_raw_controls(json), do: escape_raw_controls(json, false, [])
+
+  defp escape_raw_controls(<<>>, _in_string, acc),
+    do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp escape_raw_controls(<<"\\", c, rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, [<<"\\", c>> | acc])
+
+  defp escape_raw_controls(<<"\"", rest::binary>>, in_string, acc),
+    do: escape_raw_controls(rest, not in_string, ["\"" | acc])
+
+  defp escape_raw_controls(<<"\n", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\n" | acc])
+
+  defp escape_raw_controls(<<"\r", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\r" | acc])
+
+  defp escape_raw_controls(<<"\t", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\t" | acc])
+
+  defp escape_raw_controls(<<c, rest::binary>>, in_string, acc),
+    do: escape_raw_controls(rest, in_string, [<<c>> | acc])
 
   defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
     on_chunk.(text)
