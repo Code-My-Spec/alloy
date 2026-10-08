@@ -81,8 +81,7 @@ defmodule Alloy.Provider.Codex do
   @output_truncation 4_000
 
   # Codex is the model here; the outer loop's tools run the commands. Left on,
-  # its own shell answered for them inside the read-only sandbox: `mix test`
-  # died on `:eperm` and the outer loop never saw a tool call.
+  # its own shell answered for them and the outer loop never saw a tool call.
   @no_own_commands ["--disable", "shell_tool", "--disable", "unified_exec"]
   @error_truncation 2_000
   @zero_usage %{input_tokens: 0, output_tokens: 0}
@@ -965,13 +964,16 @@ defmodule Alloy.Provider.Codex do
 
   # Not `--ephemeral`: that stops Codex recording the thread, and the thread is
   # what gets resumed. `exec resume` has no `--sandbox`, so it goes in as a
-  # config override.
+  # config override. Both paths must describe a writable workspace: read-only
+  # also reaches the model as a policy instruction, making it refuse Alloy's
+  # write/edit calls even though those tools execute in the outer harness.
+  # Native command tools stay disabled independently of the filesystem policy.
   defp exec_args({:fresh, _reason}),
-    do: ["exec", "--skip-git-repo-check", "--sandbox", "read-only"] ++ @no_own_commands
+    do: ["exec", "--skip-git-repo-check", "--sandbox", "workspace-write"] ++ @no_own_commands
 
   defp exec_args({:resume, _session_id, _new_messages}),
     do:
-      ["exec", "resume", "--skip-git-repo-check", "-c", ~s(sandbox_mode="read-only")] ++
+      ["exec", "resume", "--skip-git-repo-check", "-c", ~s(sandbox_mode="workspace-write")] ++
         @no_own_commands
 
   # Fresh turns only: `exec resume` has no `--profile` (codex-cli 0.157.1).

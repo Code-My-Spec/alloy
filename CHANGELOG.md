@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex fresh and resumed sessions use a writable workspace so its filesystem
+  policy does not prohibit Alloy's editing tools. Native Codex command tools
+  remain disabled; Alloy still owns tool execution.
+
 ### Added
 
 - **`Alloy.Provider.ClaudeCode`**: a new provider that uses the local `claude`

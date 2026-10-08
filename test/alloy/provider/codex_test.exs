@@ -630,7 +630,7 @@ defmodule Alloy.Provider.CodexTest do
       assert List.last(args) =~ "Compacted summary"
     end
 
-    test "codex runs no command of its own, fresh or resumed" do
+    test "fresh and resumed turns permit workspace edits while disabling native commands" do
       parent = self()
       earlier = [Message.user("Remember PLUM"), Message.assistant("OK")]
 
@@ -652,6 +652,12 @@ defmodule Alloy.Provider.CodexTest do
 
       assert_receive {:args, ["exec", "--skip-git-repo-check" | _] = fresh}
       assert_receive {:args, ["exec", "resume" | _] = resume}
+
+      assert Enum.chunk_every(fresh, 2, 1, :discard)
+             |> Enum.member?(["--sandbox", "workspace-write"])
+
+      assert Enum.chunk_every(resume, 2, 1, :discard)
+             |> Enum.member?(["-c", ~s(sandbox_mode="workspace-write")])
 
       for args <- [fresh, resume], feature <- ["shell_tool", "unified_exec"] do
         assert feature in disabled(args), "codex kept #{feature} in #{inspect(args)}"
