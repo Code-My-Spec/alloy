@@ -17,8 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CLAUDE.md`/skills/plugins/hooks, or reach MCP servers - Alloy keeps sole
   ownership of the tool loop. Unlike Codex, real usage numbers
   (`usage.input_tokens` / `usage.output_tokens`) come back from the CLI
-  instead of being hardcoded to zero, so `max_budget_cents` guards work
-  against this provider.
+  including the cached halves Claude Code reports separately, and failures
+  return `%Alloy.Provider.Error{}` like the other built-in providers.
 
 ## [0.12.5] - 2026-10-09
 

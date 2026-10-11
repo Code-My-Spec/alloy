@@ -17,11 +17,11 @@ defmodule Alloy.Provider.ClaudeCodeLiveTest do
   """
   use ExUnit.Case, async: false
 
-  @moduletag :live_claude_cli
-  @moduletag timeout: 60_000
-
   alias Alloy.Message
   alias Alloy.Provider.ClaudeCode
+
+  @moduletag :live_claude_cli
+  @moduletag timeout: 60_000
 
   test "a prompt requiring a tool comes back as stop_reason: tool_use, not a completed answer" do
     tool_defs = [

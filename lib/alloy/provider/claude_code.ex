@@ -153,9 +153,9 @@ defmodule Alloy.Provider.ClaudeCode do
 
   @behaviour Alloy.Provider
 
-  alias Alloy.Message
+  alias Alloy.{Message, OSProcess}
   alias Alloy.Provider.ClaudeCode.StreamJson
-  alias Alloy.Provider.CliSession
+  alias Alloy.Provider.{CliSession, Error}
 
   @default_timeout_ms 120_000
   @default_max_run_ms :timer.minutes(30)
@@ -223,6 +223,21 @@ defmodule Alloy.Provider.ClaudeCode do
   # `on_chunk` nil is a plain completion; a function streams the reply text
   # into it as `stream-json` delivers it.
   defp run(messages, tool_defs, config, on_chunk) do
+    messages
+    |> run_turn(tool_defs, config, on_chunk)
+    |> to_provider_error()
+  end
+
+  # Every built-in provider fails with %Alloy.Provider.Error{}; the steps below
+  # still describe their failures as strings.
+  defp to_provider_error({:error, message}) when is_binary(message) do
+    kind = if Error.overflow_text?(message), do: :context_overflow, else: :unknown
+    {:error, %Error{kind: kind, message: message}}
+  end
+
+  defp to_provider_error(result), do: result
+
+  defp run_turn(messages, tool_defs, config, on_chunk) do
     case prepare_paths(config) do
       {:ok, paths} ->
         try do
@@ -264,8 +279,6 @@ defmodule Alloy.Provider.ClaudeCode do
 
   defp remember_tools(%{provider_state: %{} = state} = completion, _tool_defs),
     do: %{completion | provider_state: Map.put(state, :tools_hash, nil)}
-
-  defp remember_tools(completion, _tool_defs), do: completion
 
   defp tools_hash(tool_defs), do: :erlang.phash2(Enum.map(tool_defs, &serialize_tool_def/1))
 
@@ -538,7 +551,7 @@ defmodule Alloy.Provider.ClaudeCode do
       remaining ->
         _ = kill_os_process(os_pid)
         _ = close_and_drain(port)
-        {:error, timeout_message(limits)}
+        {:error, %Error{kind: :timeout, message: timeout_message(limits)}}
     end
   end
 
@@ -552,15 +565,14 @@ defmodule Alloy.Provider.ClaudeCode do
     end
   end
 
-  # SIGTERM with a 100ms grace window, then SIGKILL. Best-effort - if
-  # claude has already exited, the second kill is a no-op.
+  # SIGTERM with a 100ms grace window, then SIGKILL, to claude's whole process
+  # group. Best-effort - if claude has already exited, both are no-ops.
   defp kill_os_process(nil), do: :ok
 
   defp kill_os_process(os_pid) do
-    _ = System.cmd("/bin/kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+    :ok = OSProcess.signal_group(os_pid, "TERM")
     Process.sleep(100)
-    _ = System.cmd("/bin/kill", ["-KILL", Integer.to_string(os_pid)], stderr_to_stdout: true)
-    :ok
+    OSProcess.signal_group(os_pid, "KILL")
   end
 
   defp close_and_drain(port) do
@@ -711,15 +723,17 @@ defmodule Alloy.Provider.ClaudeCode do
   end
 
   defp parse_tool_blocks(text, tool_calls) do
-    tool_calls
-    |> Enum.with_index(1)
-    |> Enum.reduce_while([], fn {tool_call, index}, acc ->
-      case build_tool_block(tool_call, index) do
-        {:ok, block} -> {:cont, [block | acc]}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
+    blocks =
+      tool_calls
+      |> Enum.with_index(1)
+      |> Enum.reduce_while([], fn {tool_call, index}, acc ->
+        case build_tool_block(tool_call, index) do
+          {:ok, block} -> {:cont, [block | acc]}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+
+    case blocks do
       {:error, _} = err -> err
       blocks -> finalize_tool_blocks(text, Enum.reverse(blocks))
     end

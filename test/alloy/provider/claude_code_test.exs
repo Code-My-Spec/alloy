@@ -3,6 +3,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
 
   alias Alloy.Message
   alias Alloy.Provider.ClaudeCode
+  alias Alloy.Provider.Error
 
   describe "complete/3" do
     test "returns an end_turn assistant message from Claude Code JSON output" do
@@ -371,7 +372,9 @@ defmodule Alloy.Provider.ClaudeCodeTest do
           end)
       }
 
-      assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert {:error, %Error{message: reason}} =
+               ClaudeCode.complete([Message.user("Hi")], [], config)
+
       assert reason =~ "tool_calls"
     end
 
@@ -399,7 +402,9 @@ defmodule Alloy.Provider.ClaudeCodeTest do
           end)
       }
 
-      assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert {:error, %Error{message: reason}} =
+               ClaudeCode.complete([Message.user("Hi")], [], config)
+
       assert reason =~ "must be an object"
     end
 
@@ -426,7 +431,9 @@ defmodule Alloy.Provider.ClaudeCodeTest do
           end)
       }
 
-      assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert {:error, %Error{message: reason}} =
+               ClaudeCode.complete([Message.user("Hi")], [], config)
+
       assert reason =~ "There's an issue with the selected model."
     end
 
@@ -436,7 +443,9 @@ defmodule Alloy.Provider.ClaudeCodeTest do
         command_runner: fake_runner(fn _args, _opts -> {"not json at all", 1} end)
       }
 
-      assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert {:error, %Error{message: reason}} =
+               ClaudeCode.complete([Message.user("Hi")], [], config)
+
       assert reason =~ "claude exec failed"
     end
 
@@ -638,7 +647,7 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       result = ClaudeCode.complete([Message.user("hang")], [], config)
       elapsed = System.monotonic_time(:millisecond) - started_at
 
-      assert {:error, reason} = result
+      assert {:error, %Error{message: reason}} = result
       assert reason =~ "timed out"
       # Generous slack for TERM/KILL grace window and CI noise.
       assert elapsed < 5_000,
@@ -676,7 +685,9 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       result = ClaudeCode.complete([Message.user("deadline")], [], config)
       elapsed = System.monotonic_time(:millisecond) - started_at
 
-      assert {:error, "claude exec timed out after 150ms with no output"} = result
+      assert {:error,
+              %Error{kind: :timeout, message: "claude exec timed out after 150ms with no output"}} =
+               result
 
       assert elapsed < 5_000,
              "expected receive_timeout to cap the port timeout, took #{elapsed}ms"
@@ -718,8 +729,11 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       elapsed = System.monotonic_time(:millisecond) - started_at
 
       assert {:error,
-              "claude exec timed out after 800ms, its limit for one run, while still writing"} =
-               result
+              %Error{
+                kind: :timeout,
+                message:
+                  "claude exec timed out after 800ms, its limit for one run, while still writing"
+              }} = result
 
       assert elapsed < 5_000
     end
