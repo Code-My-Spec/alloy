@@ -145,7 +145,10 @@ defmodule Alloy.Tool.Executor do
         error: error
       }
 
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, sseq)
+    # The event carries what the call returned, as the model will see it; the
+    # meta kept on the state does not, so results are not held twice.
+    eseq =
+      emit_end(on_event, Map.put(meta, :result, result[:content]), seq_ref, corr_id, turn, sseq)
 
     meta =
       meta
@@ -167,7 +170,7 @@ defmodule Alloy.Tool.Executor do
       error: error
     }
 
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, sseq)
+    eseq = emit_end(on_event, Map.put(meta, :result, error), seq_ref, corr_id, turn, sseq)
 
     {result_block_fn(call[:type]).(call[:id], error, true),
      Map.merge(meta, %{correlation_id: corr_id, start_event_seq: sseq, end_event_seq: eseq})}
@@ -193,7 +196,7 @@ defmodule Alloy.Tool.Executor do
       error: error
     }
 
-    eseq = emit_end(on_event, meta, seq_ref, corr_id, turn, nil)
+    eseq = emit_end(on_event, Map.put(meta, :result, error), seq_ref, corr_id, turn, nil)
 
     {result_block_fn(call[:type]).(call[:id], error, true),
      Map.merge(meta, %{correlation_id: corr_id, start_event_seq: nil, end_event_seq: eseq})}

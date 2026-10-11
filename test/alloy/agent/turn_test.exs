@@ -243,6 +243,38 @@ defmodule Alloy.Agent.TurnTest do
       assert tool_end.seq > tool_start.seq
     end
 
+    test "tool_end carries the result, and text asked alongside calls is emitted" do
+      test_pid = self()
+
+      {:ok, pid} =
+        TestProvider.start_link([
+          TestProvider.tool_use_response([
+            %{type: "text", text: "Echoing it."},
+            %{id: "tool_1", name: "echo", input: %{"text" => "world"}}
+          ]),
+          TestProvider.text_response("Tool said: Echo: world")
+        ])
+
+      config = %Config{
+        provider: TestProvider,
+        provider_config: %{agent_pid: pid},
+        tools: [EchoTool]
+      }
+
+      state = State.init(config, [Message.user("Echo world")])
+      on_event = fn event -> send(test_pid, {:event, event}) end
+
+      result =
+        Turn.run_loop(state, streaming: true, on_chunk: fn _ -> :ok end, on_event: on_event)
+
+      assert result.status == :completed
+      assert_received {:event, %{event: :assistant_message, payload: %{text: "Echoing it."}}}
+      assert_received {:event, %{event: :tool_end, payload: %{result: "Echo: world"}}}
+
+      refute Enum.any?(result.tool_calls, &Map.has_key?(&1, :result)),
+             "the result went into the state's tool-call meta as well as the event"
+    end
+
     test "uses caller-supplied event_correlation_id for tool events" do
       test_pid = self()
 

@@ -230,6 +230,8 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp handle_tool_use(%State{} = state, new_msgs, opts, deadline) do
+    emit_assistant_text(new_msgs, opts, state.turn)
+
     case Middleware.run(:after_tool_request, state) do
       {:halted, reason} ->
         %{state | status: :halted, error: "Halted by middleware: #{reason}"}
@@ -286,6 +288,16 @@ defmodule Alloy.Agent.Turn do
                 do_turn(state, opts, deadline)
             end
         end
+    end
+  end
+
+  # What the model said alongside the calls it asked for. A turn's final text
+  # is its result; text written on the way to a tool call otherwise exists only
+  # as stream deltas, and a consumer recording the conversation never sees it.
+  defp emit_assistant_text(new_msgs, opts, turn) do
+    case new_msgs |> Enum.map(&Message.text/1) |> Enum.reject(&(&1 in [nil, ""])) do
+      [] -> :ok
+      texts -> Events.emit(opts, turn, {:assistant_message, %{text: Enum.join(texts, "\n")}})
     end
   end
 
