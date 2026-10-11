@@ -148,6 +148,7 @@ defmodule Alloy.Provider.ClaudeCode do
   @behaviour Alloy.Provider
 
   alias Alloy.Message
+  alias Alloy.Provider.CliSession
 
   @default_timeout_ms 120_000
   @default_claude_bin "claude"
@@ -212,7 +213,7 @@ defmodule Alloy.Provider.ClaudeCode do
     case prepare_paths(config) do
       {:ok, paths} ->
         try do
-          resume = resume_plan(config, messages)
+          resume = CliSession.plan(config, messages)
           prompt = build_turn_prompt(resume, messages, tool_defs, config)
 
           with :ok <- File.write(paths.prompt_path, prompt),
@@ -227,25 +228,6 @@ defmodule Alloy.Provider.ClaudeCode do
 
       {:error, reason} ->
         {:error, reason}
-    end
-  end
-
-  # Whether this turn can continue a prior Claude Code session rather than
-  # re-sending the whole transcript. `:erlang.phash2/1` over the prefix we
-  # believe Claude Code already has is the safety check: if a middleware
-  # (compaction, most likely) rewrote earlier history since the last call,
-  # the hash no longer matches and this falls through to `:fresh` rather
-  # than resuming a session built on a transcript that no longer exists.
-  defp resume_plan(config, messages) do
-    with %{session_id: id, sent_upto: n, prefix_hash: hash} <-
-           Map.get(config, :provider_state),
-         true <- is_binary(id) and id != "",
-         true <- is_integer(n) and n >= 0,
-         true <- length(messages) > n,
-         true <- :erlang.phash2(Enum.take(messages, n)) == hash do
-      {:resume, id, Enum.drop(messages, n)}
-    else
-      _ -> :fresh
     end
   end
 
@@ -567,7 +549,7 @@ defmodule Alloy.Provider.ClaudeCode do
          messages: [reply],
          usage: extract_usage(envelope),
          response_metadata: response_metadata(config, envelope),
-         provider_state: next_provider_state(messages, reply, envelope)
+         provider_state: CliSession.next_state(messages, reply, Map.get(envelope, "session_id"))
        }}
     else
       {:error, "Claude Code returned tool_calls for an end_turn response"}
@@ -590,35 +572,13 @@ defmodule Alloy.Provider.ClaudeCode do
          messages: [reply],
          usage: extract_usage(envelope),
          response_metadata: response_metadata(config, envelope),
-         provider_state: next_provider_state(messages, reply, envelope)
+         provider_state: CliSession.next_state(messages, reply, Map.get(envelope, "session_id"))
        }}
     end
   end
 
   defp parse_payload(payload, _config, _envelope, _messages) do
     {:error, "unexpected Claude Code response payload: #{inspect(payload)}"}
-  end
-
-  # What the *next* call needs to know to resume this session: the id, how
-  # many messages (as Alloy will see them - this reply included, since
-  # Claude Code's own session already recorded its version of this turn) are
-  # already reflected in it, and a hash of that exact prefix so a future call
-  # can detect whether something (compaction, most likely) rewrote history
-  # out from under it before trusting `--resume`.
-  defp next_provider_state(messages_before_reply, reply, envelope) do
-    case Map.get(envelope, "session_id") do
-      session_id when is_binary(session_id) and session_id != "" ->
-        prefix = messages_before_reply ++ [reply]
-
-        %{
-          session_id: session_id,
-          sent_upto: length(prefix),
-          prefix_hash: :erlang.phash2(prefix)
-        }
-
-      _ ->
-        %{}
-    end
   end
 
   defp parse_tool_blocks(text, tool_calls) do
