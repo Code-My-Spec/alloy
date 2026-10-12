@@ -176,6 +176,51 @@ defmodule Alloy.Provider.RetryTest do
     end
   end
 
+  describe "a request's receive timeout" do
+    test "is what is left of the deadline when the caller set none" do
+      seen = call_reporting_receive_timeout(%{system_prompt: nil}, 60_000)
+      assert seen > 50_000 and seen <= 60_000
+    end
+
+    # A long loop deadline would otherwise let a request that went quiet wait
+    # out the whole loop.
+    test "is capped by one the caller set" do
+      config = %{system_prompt: nil, req_options: [receive_timeout: 2_000]}
+      assert call_reporting_receive_timeout(config, :timer.hours(24)) == 2_000
+    end
+
+    test "never runs past the deadline, whatever the caller set" do
+      config = %{system_prompt: nil, req_options: [receive_timeout: :timer.hours(1)]}
+      assert call_reporting_receive_timeout(config, 60_000) <= 60_000
+    end
+  end
+
+  defp call_reporting_receive_timeout(provider_config, deadline_in) do
+    test = self()
+
+    provider =
+      Module.create(
+        :"Elixir.Alloy.Provider.RetryTest.ReportingProvider#{System.unique_integer([:positive])}",
+        quote do
+          def complete(_messages, _tools, config) do
+            send(unquote(test), {:receive_timeout, config.req_options[:receive_timeout]})
+            {:ok, %{stop_reason: :end_turn, messages: [], usage: %{}}}
+          end
+        end,
+        Macro.Env.location(__ENV__)
+      )
+      |> elem(1)
+
+    deadline = System.monotonic_time(:millisecond) + deadline_in
+    state = build_state(retry_config())
+
+    {:ok, _} =
+      Retry.call_with_retry(state, provider, provider_config, false, fn _ -> :ok end, deadline)
+
+    assert_received {:receive_timeout, seen}
+    seen
+  end
+
   # ── Helpers ───────────────────────────────────────────────────────────────
 
   defp retry_config(overrides \\ []) do

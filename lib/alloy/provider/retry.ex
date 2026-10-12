@@ -246,13 +246,24 @@ defmodule Alloy.Provider.Retry do
 
   # Sets receive_timeout in the provider's req_options based on remaining deadline.
   # This prevents a single hung HTTP request from overshooting the overall timeout.
-  # Uses Keyword.put to override any user-set value — the deadline takes precedence.
+  # A receive_timeout the caller set is a cap under that rather than overridden:
+  # with a long loop deadline, the remaining time alone would let a request that
+  # went quiet wait out the whole loop. On a retry the existing value is the one
+  # injected last, which is no larger than the cap and no smaller than what is
+  # left now, so the minimum is still right.
   defp inject_receive_timeout(provider_config, deadline) do
     remaining = deadline - System.monotonic_time(:millisecond)
     # Floor at 1s so we don't set absurdly short timeouts, but also
     # don't overshoot the deadline when remaining time is under 5s.
     timeout = max(remaining, 1_000)
     existing = Map.get(provider_config, :req_options, [])
+
+    timeout =
+      case Keyword.get(existing, :receive_timeout) do
+        cap when is_integer(cap) -> min(timeout, cap)
+        _ -> timeout
+      end
+
     Map.put(provider_config, :req_options, Keyword.put(existing, :receive_timeout, timeout))
   end
 end
