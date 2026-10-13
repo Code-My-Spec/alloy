@@ -76,7 +76,7 @@ application. Existing `until_tool` requirements must also be satisfied.
 early completion succeeds. No extra provider request or synthetic assistant
 message is added. With streaming, tool output is returned in the final result;
 it is not emitted as fabricated assistant text deltas. This control applies to
-ordinary local tools, not provider-executed tools or the legacy memory router.
+ordinary local tools, including memory tools, rather than provider-executed tools.
 
 ## Prepare each request
 
@@ -100,7 +100,9 @@ Pass `provider_state:` in the new provider configuration to supply replacement
 state explicitly. Preparing unchanged provider configuration retains live state.
 
 Run counters, usage, and deadlines are preserved. Preparation runs before
-automatic compaction, which budgets the prepared request. Context-overflow
+automatic compaction, which is appended after caller middleware and budgets
+the prepared request. Explicitly listing `Alloy.Context.Compactor` preserves
+your chosen ordering. Context-overflow
 recovery may invoke the hook again; hooks should not repeat external effects or
 restore context that compaction just removed. This helper does not translate
 provider-specific history; follow the provider compatibility rules when switching.

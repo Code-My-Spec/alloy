@@ -1,16 +1,15 @@
 defmodule Alloy.Agent.CodexRecoveryTest do
   use ExUnit.Case, async: true
 
-  alias Alloy.Agent.Server
   alias Alloy.Provider.Codex
 
-  test "a server recovers a missing thread using a new generation with history intact" do
+  test "an application-owned supervisor runs the loop and recovers with history intact" do
     parent = self()
 
     runner =
       fn _executable, args, _opts ->
         path = Enum.at(args, Enum.find_index(args, &(&1 == "--output-last-message")) + 1)
-        send(parent, {:server_invocation, args})
+        send(parent, {:host_invocation, args})
 
         if Enum.take(args, 2) == ["exec", "resume"] do
           {~s({"type":"error","message":"thread not found"}\n), 1}
@@ -27,24 +26,33 @@ defmodule Alloy.Agent.CodexRecoveryTest do
       command_runner: runner
     }
 
-    server =
-      start_supervised!({Server, provider: {Codex, config}, max_retries: 1, retry_backoff_ms: 1})
+    supervisor = start_supervised!(Task.Supervisor)
 
-    assert {:ok, _result} = Server.chat(server, "original")
-    assert_receive {:server_invocation, _args}
-    assert {:error, _result} = Server.chat(server, "lost-thread-request")
-    assert_receive {:server_invocation, ["exec", "resume" | _rest]}
-    refute_received {:server_invocation, _args}
-    history = Server.messages(server)
+    run = fn prompt, config, messages ->
+      supervisor
+      |> Task.Supervisor.async_nolink(fn ->
+        Alloy.run(prompt,
+          provider: {Codex, config},
+          messages: messages,
+          max_retries: 1,
+          retry_backoff_ms: 1
+        )
+      end)
+      |> Task.await()
+    end
 
-    assert :ok =
-             Server.set_model(server,
-               provider: {Codex, Map.put(config, :session_generation, "recovery-1")}
-             )
+    assert {:ok, first} = run.("original", config, [])
+    assert_receive {:host_invocation, _args}
+    continuation = Map.put(config, :provider_state, first.metadata.provider_state)
+    assert {:error, failed} = run.("lost-thread-request", continuation, first.messages)
+    assert_receive {:host_invocation, ["exec", "resume" | _rest]}
+    refute_received {:host_invocation, _args}
 
-    assert Server.messages(server) == history
-    assert {:ok, _result} = Server.chat(server, "continue")
-    assert_receive {:server_invocation, args}
+    recovered_config = Map.put(continuation, :session_generation, "recovery-1")
+    assert {:ok, final} = run.("continue", recovered_config, failed.messages)
+    assert final.error == nil
+    assert final.turns == 1
+    assert_receive {:host_invocation, args}
     refute "resume" in args
     assert List.last(args) =~ "original"
     assert List.last(args) =~ "lost-thread-request"

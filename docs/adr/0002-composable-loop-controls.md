@@ -28,7 +28,8 @@ without taking on the persistence and scheduling of a durable runtime.
 - `State.prepare/2` updates request inputs through existing `:before_completion`
   middleware, rebuilding tools and deriving model limits together. Explicit
   provider changes clear incompatible opaque provider state conservatively.
-  Preparation precedes automatic compaction so it budgets the prepared request.
+  Default compaction middleware is appended after caller middleware so it
+  budgets prepared inputs. Explicit compactor placement remains respected.
 - Transcript validation and missing-result repair are explicit utilities.
   Repair never executes tools and refuses ambiguous/orphaned results.
 - `tool_concurrency` caps parallel execution per run, retaining the existing

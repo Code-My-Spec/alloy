@@ -1,5 +1,8 @@
 # Schema reuse and result quality
 
+These measurements used the recorded 0.12.5-based development source, before
+reconciliation with 0.13. They are not performance measurements of the 0.13 release.
+
 This records the cache-only stage. Subsequent live-model findings are in
 [the live quality and speed report](live/REPORT.md).
 

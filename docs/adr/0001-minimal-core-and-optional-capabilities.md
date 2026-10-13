@@ -53,7 +53,7 @@ but persistent-session hosts must leave fallbacks empty: a successful fallback
 would hide a resume failure and its stale continuation state.
 After any failed, cancelled or crashed turn in a persistent session, including
 cancellation during Alloy tools after a successful provider reply, the host must
-change `:session_generation` before continuing. In 0.12, `Server.set_model/2` can do this without discarding history;
+change `:session_generation` before continuing. In 0.13, `State.prepare/2` can do this without discarding history;
 this also recovers deleted/corrupt threads. No persistent invalidation registry
 or durable session service is added to core. Continuations are single-caller,
 not a concurrent shared session primitive.

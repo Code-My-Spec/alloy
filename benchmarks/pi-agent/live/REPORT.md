@@ -1,5 +1,8 @@
 # Live quality and speed benchmark — 2026-10-14
 
+These measurements used the recorded 0.12.5-based development source, before
+reconciliation with 0.13. They are not performance measurements of the 0.13 release.
+
 Alloy and Pi Agent Core 1.2.0 both passed all 24 tasks in final confirmation,
 with no invalid tool calls or wrong submissions. Median end-to-end latency was
 5.99 s for Alloy and 6.15 s for Pi.

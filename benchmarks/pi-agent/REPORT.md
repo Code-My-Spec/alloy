@@ -1,5 +1,8 @@
 # Pi Agent comparison baseline — 2026-10-13
 
+These measurements used the recorded 0.12.5-based development source, before
+reconciliation with 0.13. They are not performance measurements of the 0.13 release.
+
 All 18 deterministic scenarios passed their engine-specific expectations across
 three fresh-process repetitions: 300 measured samples per scenario per engine,
 plus warmups. Sixteen scenarios produced matching normalized outcomes; two

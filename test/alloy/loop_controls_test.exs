@@ -632,20 +632,13 @@ defmodule Alloy.LoopControlsTest do
     assert_receive {:request, _, [%{name: "submit"}], _}
   end
 
-  test "preparation rejects unsupported inputs and reserved memory conflicts" do
+  test "preparation rejects unsupported inputs and duplicate tools" do
     for opts <- [[messages: ["raw"]], [system_prompt: 1], [unknown: true]] do
       assert_raise ArgumentError, fn -> State.prepare(state([]), opts) end
     end
 
-    memory = {Alloy.Test.MemoryStore, self()}
-    state = state(provider: Alloy.Provider.Anthropic, memory: memory)
-
-    assert_raise ArgumentError, ~r/reserves/, fn ->
-      State.prepare(state, tools: [tool(name: "memory")])
-    end
-
-    assert_raise ArgumentError, ~r/Anthropic-only/, fn ->
-      State.prepare(state, provider: TestProvider)
+    assert_raise ArgumentError, ~r/unique/, fn ->
+      State.prepare(state([]), tools: [tool(), tool()])
     end
   end
 
