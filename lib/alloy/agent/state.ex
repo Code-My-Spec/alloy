@@ -8,6 +8,7 @@ defmodule Alloy.Agent.State do
 
   alias Alloy.Agent.Config
   alias Alloy.{Message, Usage}
+  alias Alloy.Tool.Registry
 
   @type status :: :idle | :running | :completed | :error | :max_turns | :budget_exceeded | :halted
 
@@ -23,6 +24,7 @@ defmodule Alloy.Agent.State do
           tool_calls: [map()],
           tool_defs: [map()],
           tool_fns: %{String.t() => Alloy.Tool.Registry.tool()},
+          tool_schema_cache: map(),
           provider_state: map(),
           provider_response_metadata: map(),
           run_metadata: map(),
@@ -48,6 +50,8 @@ defmodule Alloy.Agent.State do
     status: :idle,
     tool_defs: [],
     tool_fns: %{},
+    # Internal, bounded to the latest validated tool set; never part of Result.
+    tool_schema_cache: %{},
     provider_state: %{},
     provider_response_metadata: %{},
     run_metadata: %{},
@@ -77,6 +81,68 @@ defmodule Alloy.Agent.State do
       agent_id: agent_id
     }
   end
+
+  @doc """
+  Prepares request inputs from `:before_completion` middleware.
+
+  Accepts `:messages`, `:tools`, `:system_prompt`, and `:provider` (the same
+  provider tuple accepted by `Alloy.run/2`). Changes persist for later turns.
+  Tools and their wire definitions are rebuilt together. Provider changes
+  re-derive model limits and discard previous opaque provider state; pass an
+  explicit `provider_state` in the new provider config to restore it.
+  Run counters, deadlines, usage, and tool history are preserved.
+  """
+  @spec prepare(t(), keyword()) :: t()
+  def prepare(%__MODULE__{} = state, opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:messages, :tools, :system_prompt, :provider])
+    config = prepare_config(state.config, opts)
+    {tool_defs, tool_fns} = Registry.build(config.tools)
+    messages = Keyword.get(opts, :messages, messages(state))
+
+    unless is_list(messages) and Enum.all?(messages, &is_struct(&1, Message)) do
+      raise ArgumentError, "messages must be a list of Alloy.Message structs"
+    end
+
+    %{
+      state
+      | config: config,
+        tool_defs: tool_defs,
+        tool_fns: tool_fns,
+        messages: messages,
+        messages_new: [],
+        provider_state: prepared_provider_state(state, config),
+        provider_response_metadata:
+          if(provider_changed?(state.config, config),
+            do: %{},
+            else: state.provider_response_metadata
+          )
+    }
+  end
+
+  defp prepare_config(config, opts) do
+    config =
+      case Keyword.fetch(opts, :provider) do
+        {:ok, provider} -> Config.with_provider(config, provider)
+        :error -> config
+      end
+
+    config = Config.with_tools(config, Keyword.get(opts, :tools, config.tools))
+    prompt = Keyword.get(opts, :system_prompt, config.system_prompt)
+
+    unless is_nil(prompt) or is_binary(prompt),
+      do: raise(ArgumentError, "system_prompt must be a string or nil")
+
+    %{config | system_prompt: prompt}
+  end
+
+  defp prepared_provider_state(state, config) do
+    if provider_changed?(state.config, config),
+      do: Map.get(config.provider_config, :provider_state, %{}),
+      else: state.provider_state
+  end
+
+  defp provider_changed?(old, new),
+    do: old.provider != new.provider or old.provider_config != new.provider_config
 
   @doc """
   Append messages to the conversation history.

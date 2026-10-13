@@ -3,11 +3,13 @@ defmodule Alloy.Middleware do
   Behaviour for middleware that wraps the agent loop.
 
   Middleware runs at defined hook points:
-  - `:before_completion` - Before calling the provider
-  - `:after_completion` - After provider response with :end_turn (final state)
+  - `:before_completion` - Prepare request inputs before compaction and the provider call
+  - `:after_completion` - Finalize a normal answer or successful `:stop_after_tool` completion
   - `:after_compaction` - After context compaction occurs (only fires when messages changed)
   - `:after_tool_request` - After provider response with :tool_use (gates tool execution)
   - `:after_tool_execution` - After tools have been executed
+  - `:before_tool_call` - Compose argument edits and policy checks before execution
+  - `:after_tool_call` - Replace each result's content/data before publication
   - `:on_error` - When an error occurs
 
   Middleware can modify state (e.g., add logging, enforce policies,
@@ -24,10 +26,17 @@ defmodule Alloy.Middleware do
           | :after_tool_execution
           | :on_error
           | :before_tool_call
+          | :after_tool_call
           | :session_start
           | :session_end
 
-  @type call_result :: State.t() | {:block, String.t()} | {:halt, String.t()} | {:edit, map()}
+  @type tool_result :: %{content: String.t(), data: map() | nil, is_error: boolean()}
+  @type call_result ::
+          State.t()
+          | {:block, String.t()}
+          | {:halt, String.t()}
+          | {:edit, map()}
+          | {:result, tool_result()}
 
   @doc """
   Called at the specified hook point. Returns modified state,
@@ -72,33 +81,73 @@ defmodule Alloy.Middleware do
   The `{:edit, modified_call}` return lets middleware rewrite tool arguments
   before execution. The modified call must keep the same `:id` and `:name`.
 
-  Note: `{:edit, ...}`, `{:block, ...}`, and `{:halt, ...}` all stop the
-  middleware chain immediately. The first middleware that returns one of
-  these wins — subsequent middleware modules will not see the tool call.
+  Edits pass the modified call to subsequent middleware. Block and halt
+  stop the chain. State returned from this hook does not alter loop state.
   """
   @spec run_before_tool_call(State.t(), map()) ::
           :ok | {:block, String.t()} | {:edit, map()} | {:halted, String.t()}
   def run_before_tool_call(%State{} = state, tool_call) do
-    updated_context = Map.put(state.config.context, :current_tool_call, tool_call)
-    updated_config = %{state.config | context: updated_context}
-    updated_state = %{state | config: updated_config}
+    result =
+      Enum.reduce_while(state.config.middleware, {:edit, tool_call}, fn middleware,
+                                                                        {:edit, current} ->
+        updated_state = tool_state(state, current)
 
-    Enum.reduce_while(updated_state.config.middleware, :ok, fn middleware, _acc ->
-      case middleware.call(:before_tool_call, updated_state) do
-        {:block, reason} ->
-          {:halt, {:block, reason}}
+        case middleware.call(:before_tool_call, updated_state) do
+          {:block, reason} ->
+            {:halt, {:block, reason}}
 
-        {:halt, reason} ->
-          {:halt, {:halted, reason}}
+          {:halt, reason} ->
+            {:halt, {:halted, reason}}
 
-        {:edit, modified_call} ->
-          validate_edit!(tool_call, modified_call)
-          {:halt, {:edit, modified_call}}
+          {:edit, modified_call} ->
+            validate_edit!(tool_call, modified_call)
+            {:cont, {:edit, modified_call}}
 
-        %State{} ->
-          {:cont, :ok}
+          %State{} ->
+            {:cont, {:edit, current}}
+        end
+      end)
+
+    if result == {:edit, tool_call}, do: :ok, else: result
+  end
+
+  @doc """
+  Runs `:after_tool_call` before publishing each tool outcome.
+
+  Context contains `:current_tool_call` and `:current_tool_result` with
+  `:content`, `:data`, and `:is_error`. Return `{:result, result}` to replace
+  content and structured data, or the state unchanged. Replacements compose;
+  they must retain `:is_error`. State changes are not applied to the loop.
+  Hook failures abort execution rather than publishing an unredacted result.
+  """
+  @spec run_after_tool_call(State.t(), map(), tool_result()) :: tool_result()
+  def run_after_tool_call(state, call, result) do
+    Enum.reduce(state.config.middleware, result, fn middleware, current ->
+      scoped = tool_state(state, call, current)
+
+      case middleware.call(:after_tool_call, scoped) do
+        %State{} -> current
+        {:result, replacement} -> validate_result!(current, replacement)
       end
     end)
+  end
+
+  defp tool_state(state, call, result \\ nil) do
+    context =
+      state.config.context
+      |> Map.put(:current_tool_call, call)
+      |> Map.put(:current_tool_result, result)
+
+    %{state | config: %{state.config | context: context}}
+  end
+
+  defp validate_result!(original, %{content: content, data: data, is_error: error} = result)
+       when is_binary(content) and (is_map(data) or is_nil(data)) and error == original.is_error,
+       do: Map.take(result, [:content, :data, :is_error])
+
+  defp validate_result!(_original, _result) do
+    raise ArgumentError,
+          "tool result replacement requires string content, map/nil data, and unchanged is_error"
   end
 
   defp validate_edit!(original, modified) do

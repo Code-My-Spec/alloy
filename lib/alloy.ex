@@ -47,6 +47,9 @@ defmodule Alloy do
   - `:max_tokens` - context window budget for compaction (default: provider model window when known, otherwise `200_000`)
   - `:compaction` - grouped compaction settings like `reserve_tokens`, `keep_recent_tokens`, and `fallback` (default: derived from `:max_tokens`)
   - `:middleware` - list of `Alloy.Middleware` modules (default: `[]`)
+  - `:tool_validation` - `:required` for object/required-key checks (default), or `:schema` for optional JSON Schema validation
+  - `:tool_concurrency` - positive integer limiting parallel tool execution (default: scheduler count)
+  - `:stop_after_tool` - complete successfully after this tool succeeds; settle the whole round and return its output (default: `nil`)
   - `:working_directory` - base path for file tools (default: `"."`)
   - `:context` - arbitrary map passed to tools and middleware (default: `%{}`)
   - `:max_pending` - max queued async `send_message/3` requests while one is running (default: `0`)

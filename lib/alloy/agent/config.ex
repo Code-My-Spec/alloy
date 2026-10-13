@@ -2,8 +2,8 @@ defmodule Alloy.Agent.Config do
   @moduledoc """
   Configuration for an agent run.
 
-  Built from the options passed to `Alloy.run/2`. Immutable for the
-  duration of the run.
+  Built from the options passed to `Alloy.run/2`. Request inputs can be
+  updated through `Alloy.Agent.State.prepare/2` in middleware.
   """
 
   alias Alloy.Context.Compactor
@@ -60,6 +60,9 @@ defmodule Alloy.Agent.Config do
           retry_backoff_ms: pos_integer(),
           timeout_ms: pos_integer(),
           tool_timeout: pos_integer(),
+          tool_concurrency: pos_integer() | nil,
+          tool_validation: :required | :schema,
+          stop_after_tool: String.t() | nil,
           middleware: [module()],
           compaction: compaction(),
           compaction_explicit: %{
@@ -97,6 +100,9 @@ defmodule Alloy.Agent.Config do
     retry_backoff_ms: 1_000,
     timeout_ms: 120_000,
     tool_timeout: 120_000,
+    tool_concurrency: nil,
+    tool_validation: :required,
+    stop_after_tool: nil,
     middleware: [],
     compaction: %{
       reserve_tokens: 16_384,
@@ -162,6 +168,9 @@ defmodule Alloy.Agent.Config do
       retry_backoff_ms: Keyword.get(opts, :retry_backoff_ms, 1_000),
       timeout_ms: Keyword.get(opts, :timeout_ms, 120_000),
       tool_timeout: Keyword.get(opts, :tool_timeout, 120_000),
+      tool_concurrency: validate_tool_concurrency!(Keyword.get(opts, :tool_concurrency)),
+      tool_validation: validate_tool_validation!(Keyword.get(opts, :tool_validation, :required)),
+      stop_after_tool: validate_stop_after_tool!(Keyword.get(opts, :stop_after_tool)),
       middleware: Keyword.get(opts, :middleware, []),
       compaction: compaction,
       compaction_explicit: compaction_explicit,
@@ -183,6 +192,33 @@ defmodule Alloy.Agent.Config do
       until_tool: Keyword.get(opts, :until_tool),
       memory: validate_memory(Keyword.get(opts, :memory), provider_mod, tools)
     }
+  end
+
+  defp validate_tool_concurrency!(nil), do: nil
+  defp validate_tool_concurrency!(n) when is_integer(n) and n > 0, do: n
+
+  defp validate_tool_concurrency!(value),
+    do:
+      raise(ArgumentError, "tool_concurrency must be a positive integer, got: #{inspect(value)}")
+
+  defp validate_tool_validation!(mode) when mode in [:required, :schema], do: mode
+
+  defp validate_tool_validation!(value),
+    do:
+      raise(ArgumentError, "tool_validation must be :required or :schema, got: #{inspect(value)}")
+
+  defp validate_stop_after_tool!(nil), do: nil
+  defp validate_stop_after_tool!(name) when is_binary(name) and byte_size(name) > 0, do: name
+
+  defp validate_stop_after_tool!(value),
+    do:
+      raise(ArgumentError, "stop_after_tool must be a nonempty tool name, got: #{inspect(value)}")
+
+  @doc "Updates configured tools, preserving the reserved memory-tool boundary."
+  @spec with_tools(t(), [module() | Alloy.Tool.Inline.t()]) :: t()
+  def with_tools(%__MODULE__{} = config, tools) when is_list(tools) do
+    _ = validate_memory(config.memory, config.provider, tools)
+    %{config | tools: tools}
   end
 
   defp validate_memory(nil, _provider, _tools), do: nil
@@ -282,8 +318,14 @@ defmodule Alloy.Agent.Config do
         fallback: config.compaction.fallback,
         clear_tool_results: config.compaction.clear_tool_results,
         keep_recent_tool_results: config.compaction.keep_recent_tool_results,
-        summary_system_prompt: config.compaction.summary_system_prompt,
-        summary_prompt: config.compaction.summary_prompt
+        summary_system_prompt:
+          Map.get(
+            config.compaction,
+            :summary_system_prompt,
+            Compactor.default_summary_system_prompt()
+          ),
+        summary_prompt:
+          Map.get(config.compaction, :summary_prompt, Compactor.default_summary_prompt())
       }
 
     %{

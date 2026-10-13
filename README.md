@@ -559,6 +559,10 @@ middleware, or names an unknown tool does not satisfy `until_tool`.
 
 ### Middleware: editing tool arguments
 
+Edits pass through later middleware; block and halt stop the chain. See
+[loop controls](docs/loop-controls.md) for result hooks, schema validation,
+successful tool completion, request preparation, and transcript repair.
+
 Middleware can return `{:edit, modified_call}` from `:before_tool_call` to rewrite
 tool arguments before execution (e.g., policy enforcement, input sanitization):
 

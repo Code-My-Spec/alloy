@@ -14,7 +14,7 @@ defmodule Alloy.Agent.Turn do
   alias Alloy.Memory.Router, as: MemoryRouter
   alias Alloy.{Message, Middleware}
   alias Alloy.Provider.{Error, Retry}
-  alias Alloy.Tool.Executor
+  alias Alloy.Tool.{Executor, Validation}
 
   require Logger
 
@@ -112,10 +112,7 @@ defmodule Alloy.Agent.Turn do
     turn = state.turn + 1
 
     :telemetry.span([:alloy, :turn], %{turn: turn}, fn ->
-      step =
-        with {:continue, state} <- compact(state, turn, deadline) do
-          complete(state, opts, deadline, false)
-        end
+      step = complete(state, opts, deadline, false)
 
       {step, %{turn: turn, status: step_status(step)}}
     end)
@@ -143,7 +140,8 @@ defmodule Alloy.Agent.Turn do
   end
 
   defp complete(%State{} = state, opts, deadline, prompt_retried?) do
-    with {:continue, state} <- run_middleware(:before_completion, state) do
+    with {:continue, state} <- run_middleware(:before_completion, state),
+         {:continue, state} <- compact(state, state.turn + 1, deadline) do
       case request(state, opts, deadline) do
         {:ok, %{stop_reason: :refusal} = response} ->
           {:halt, refuse(state, response)}
@@ -309,6 +307,7 @@ defmodule Alloy.Agent.Turn do
   defp execute_tools(%State{} = state, tool_calls, opts) do
     {memory_calls, regular_calls} = split_memory_calls(tool_calls, state.config.memory)
     memory_results = dispatch_memory(memory_calls, state.config.memory)
+    state = prepare_tool_schemas(state, regular_calls)
 
     case run_executor(regular_calls, state, opts) do
       {:halted, reason} ->
@@ -319,6 +318,46 @@ defmodule Alloy.Agent.Turn do
         |> answer_tool_calls(tool_calls, memory_results ++ result_blocks)
         |> State.append_tool_calls(tool_call_meta)
         |> then(&run_middleware(:after_tool_execution, &1))
+        |> maybe_finish_after_tool(tool_call_meta)
+    end
+  end
+
+  defp prepare_tool_schemas(state, []), do: state
+
+  defp prepare_tool_schemas(state, _calls) do
+    {_schemas, cache} =
+      Validation.prepare(state.tool_fns, state.config.tool_validation, state.tool_schema_cache)
+
+    %{state | tool_schema_cache: cache}
+  end
+
+  defp maybe_finish_after_tool({:halt, _state} = halted, _calls), do: halted
+
+  defp maybe_finish_after_tool({:continue, state} = next, calls) do
+    calls = Enum.take(state.tool_calls, -length(calls))
+    selected = Enum.find(calls, &(&1.name == state.config.stop_after_tool and is_nil(&1.error)))
+
+    with %{} <- selected,
+         false <- until_tool_pending?(state),
+         %{content: content} = block <- final_tool_block(state, selected.id),
+         false <- Map.get(block, :is_error, false) do
+      final_tool =
+        selected |> Map.take([:id, :name, :structured_data]) |> Map.put(:content, content)
+
+      state = State.merge_run_metadata(state, %{final_tool: final_tool})
+      finish(state)
+    else
+      _ -> next
+    end
+  end
+
+  defp final_tool_block(state, id) do
+    case List.last(State.messages(state)) do
+      %Message{role: :user, content: blocks} when is_list(blocks) ->
+        Enum.find(blocks, &(&1[:type] == "tool_result" and &1[:tool_use_id] == id))
+
+      _message ->
+        nil
     end
   end
 

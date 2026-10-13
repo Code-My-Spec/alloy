@@ -9,7 +9,9 @@ defmodule Alloy.Result do
 
     * `:text` — the text of the last assistant message (see `Alloy.Message.text/1`):
       `""` when that message has no text blocks (it only called tools, or the
-      output was cut off), `nil` only when the conversation has no assistant message
+      output was cut off), `nil` only when the conversation has no assistant message.
+      With `:stop_after_tool`, this is the selected tool's final content instead;
+      its metadata is in `metadata.final_tool`
     * `:thinking` — the final assistant thinking/reasoning text (or `nil` if none),
       so callers need not dig it out of the last message's content blocks
     * `:messages` — full conversation history
@@ -69,7 +71,7 @@ defmodule Alloy.Result do
   @spec from_state(State.t()) :: t()
   def from_state(%State{} = state) do
     %__MODULE__{
-      text: State.last_assistant_text(state),
+      text: final_text(state),
       thinking: State.last_assistant_thinking(state),
       messages: State.messages(state),
       usage: state.usage,
@@ -114,8 +116,14 @@ defmodule Alloy.Result do
     %{}
     |> maybe_put_metadata(:provider_state, state.provider_state)
     |> maybe_put_metadata(:provider_response, state.provider_response_metadata)
-    |> maybe_put_metadata(:run, state.run_metadata)
+    |> maybe_put_metadata(:run, Map.delete(state.run_metadata, :final_tool))
+    |> maybe_put_metadata(:final_tool, Map.get(state.run_metadata, :final_tool, %{}))
   end
+
+  defp final_text(%State{status: :completed, run_metadata: %{final_tool: %{content: content}}}),
+    do: content
+
+  defp final_text(state), do: State.last_assistant_text(state)
 
   defp maybe_put_metadata(metadata, _key, value) when is_map(value) and map_size(value) == 0,
     do: metadata

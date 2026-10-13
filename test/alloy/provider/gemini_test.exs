@@ -154,7 +154,7 @@ defmodule Alloy.Provider.GeminiTest do
 
       assert [%{"functionDeclarations" => [tool]}] = decoded["tools"]
       assert tool["name"] == "read"
-      assert tool["parameters"]["properties"]["file_path"]["type"] == "string"
+      assert tool["parametersJsonSchema"]["properties"]["file_path"]["type"] == "string"
       assert {"x-goog-api-key", "gem-test-key"} in headers
     end
 
@@ -211,6 +211,9 @@ defmodule Alloy.Provider.GeminiTest do
 
       assert [%{"functionDeclarations" => [tool]}] = decoded["tools"]
       refute Map.has_key?(tool, "strict")
+      refute Map.has_key?(tool, "parameters")
+      assert tool["parametersJsonSchema"]["additionalProperties"] == false
+      assert tool["parametersJsonSchema"]["required"] == ["query"]
     end
 
     test "formats tool results as function responses using the original tool call name" do
@@ -240,7 +243,40 @@ defmodule Alloy.Provider.GeminiTest do
 
       assert function_response["id"] == "call_abc"
       assert function_response["name"] == "read"
-      assert function_response["response"] == %{"content" => "file contents here"}
+      assert function_response["response"] == %{"output" => "file contents here"}
+    end
+
+    test "preserves tool text in output or error envelopes without reinterpreting JSON" do
+      for {text, is_error} <- [
+            {~s({"value":3973}), false},
+            {~s([1,2,3]), false},
+            {~s({"is_error":true,"error":"ordinary data"}), false},
+            {~s({"output":"must remain an error"}), true},
+            {"unavailable", true}
+          ] do
+        messages = [
+          Message.assistant_blocks([
+            %{type: "tool_use", id: "c1", name: "calculate", input: %{}}
+          ]),
+          Message.tool_results([Message.tool_result_block("c1", text, is_error)])
+        ]
+
+        Gemini.complete(messages, [], config_that_captures_request())
+        assert_received {:request_body, body}
+        response = body |> Jason.decode!() |> Map.fetch!("contents") |> List.last()
+
+        assert [
+                 %{
+                   "functionResponse" => %{
+                     "id" => "c1",
+                     "name" => "calculate",
+                     "response" => payload
+                   }
+                 }
+               ] = response["parts"]
+
+        assert payload == %{if(is_error, do: "error", else: "output") => text}
+      end
     end
 
     test "formats thinking blocks back into Gemini thought parts" do

@@ -46,7 +46,7 @@ defmodule Alloy.MixProject do
         "hex.audit",
         "compile --warnings-as-errors --force",
         "xref graph --format cycles --label compile-connected --fail-above 0",
-        "credo",
+        "credo --strict",
         "test --warnings-as-errors --cover",
         "dialyzer"
       ]
@@ -75,6 +75,7 @@ defmodule Alloy.MixProject do
       {:mint, "~> 1.11"},
       {:jason, "~> 1.2"},
       {:telemetry, "~> 1.0"},
+      {:ex_json_schema, "~> 0.11.5", optional: true},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
@@ -99,6 +100,7 @@ defmodule Alloy.MixProject do
       extras: [
         "docs/events.md",
         "docs/provider-compatibility.md",
+        "docs/loop-controls.md",
         "docs/recipes/sub-agents.md",
         "docs/recipes/mcp-tools.md",
         "docs/recipes/code-mode.md",
@@ -106,7 +108,7 @@ defmodule Alloy.MixProject do
         "livebooks/quickstart.livemd"
       ],
       groups_for_extras: [
-        Guides: ~r{docs/(events|provider-compatibility)\.md|livebooks/.*},
+        Guides: ~r{docs/(events|provider-compatibility|loop-controls)\.md|livebooks/.*},
         Recipes: ~r{docs/recipes/.*}
       ],
       groups_for_modules: [
@@ -121,6 +123,7 @@ defmodule Alloy.MixProject do
           Alloy.Agent.Turn,
           Alloy.Message,
           Alloy.Result,
+          Alloy.Transcript,
           Alloy.Session,
           Alloy.Usage
         ],

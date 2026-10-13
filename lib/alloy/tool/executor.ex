@@ -8,6 +8,11 @@ defmodule Alloy.Tool.Executor do
   returns `concurrent?: false` waits for everything before it and runs
   alone.
 
+  `:tool_concurrency` limits parallel calls (defaults to the scheduler count).
+  `:tool_validation` defaults to required-key checks; `:schema` enables optional
+  JSON Schema validation. Each outcome passes through `:after_tool_call`
+  middleware before transcript and event publication.
+
   Each call runs in an unlinked task under `Alloy.TaskSupervisor`, bounded
   by the agent's `:tool_timeout`. A tool that raises, exits, throws or
   times out produces an `is_error` tool result instead of crashing the
@@ -19,6 +24,7 @@ defmodule Alloy.Tool.Executor do
   alias Alloy.Middleware
   alias Alloy.Tool.Inline
   alias Alloy.Tool.Registry
+  alias Alloy.Tool.Validation
 
   require Logger
 
@@ -34,7 +40,13 @@ defmodule Alloy.Tool.Executor do
   @spec execute_all([map()], %{String.t() => Registry.tool()}, State.t(), keyword()) ::
           {:ok, Message.t(), [map()]} | {:halted, String.t()}
   def execute_all(tool_calls, tool_fns, %State{} = state, opts) when is_list(opts) do
+    {schemas, _cache} =
+      Validation.prepare(tool_fns, state.config.tool_validation, state.tool_schema_cache)
+
     run = %{
+      state: state,
+      schemas: schemas,
+      concurrency: state.config.tool_concurrency || System.schedulers_online(),
       tool_fns: tool_fns,
       context: build_context(state),
       timeout: state.config.tool_timeout,
@@ -83,35 +95,38 @@ defmodule Alloy.Tool.Executor do
   #
   # tool_start is emitted here, before the task exists, and tool_end after
   # it finishes, so the pair matches even when the task is killed on
-  # timeout. At most schedulers_online calls run at once (async_stream's
-  # default, which tools calling rate-limited APIs rely on); a queued call's
-  # duration includes its wait.
+  # timeout. Parallelism uses the configured cap, defaulting to schedulers_online;
+  # a queued call's duration includes its wait.
   defp run_batch(batch, run) do
     started = batch |> Enum.with_index() |> Enum.map(&start(&1, run))
     watcher = watch_caller(self(), length(started))
 
-    results =
-      Alloy.TaskSupervisor
-      |> Task.Supervisor.async_stream_nolink(started, &{&1, invoke_watched(&1.tag, run, watcher)},
-        timeout: run.timeout,
-        on_timeout: :kill_task,
-        max_concurrency: min(length(batch), System.schedulers_online()),
-        ordered: false,
-        zip_input_on_exit: true
-      )
-      |> Enum.map(fn
-        {:ok, {started, outcome}} ->
-          finish(started, outcome, run)
+    try do
+      results =
+        Alloy.TaskSupervisor
+        |> Task.Supervisor.async_stream_nolink(
+          started,
+          &{&1, invoke_watched(&1.tag, run, watcher)},
+          timeout: run.timeout,
+          on_timeout: :kill_task,
+          max_concurrency: min(length(batch), run.concurrency),
+          ordered: false,
+          zip_input_on_exit: true
+        )
+        |> Enum.map(fn
+          {:ok, {started, outcome}} ->
+            finish(started, outcome, run)
 
-        {:exit, {started, reason}} ->
-          finish(started, exit_outcome(started.call, reason, run), run)
-      end)
+          {:exit, {started, reason}} ->
+            finish(started, exit_outcome(started.call, reason, run), run)
+        end)
 
-    send(watcher, :done)
-
-    results
-    |> Enum.sort_by(fn {index, _pair} -> index end)
-    |> Enum.map(fn {_index, pair} -> pair end)
+      results
+      |> Enum.sort_by(fn {index, _pair} -> index end)
+      |> Enum.map(fn {_index, pair} -> pair end)
+    after
+      send(watcher, :done)
+    end
   end
 
   # The tasks are unlinked, so a cancelled turn — killed outright, with no
@@ -212,7 +227,8 @@ defmodule Alloy.Tool.Executor do
   defp invoke({:execute, call}, run) do
     with {:ok, tool} <- fetch_tool(run.tool_fns, call[:name]),
          input = call[:input] || %{},
-         :ok <- check_input(input, tool) do
+         :ok <- check_input(input, tool),
+         :ok <- Validation.check(input, call[:name], run.schemas) do
       execute_tool(tool, input, call, run.context)
     end
   end
@@ -299,12 +315,22 @@ defmodule Alloy.Tool.Executor do
            valid_text(diagnostic || visible), nil}
       end
 
+    original = %{
+      content: block.content,
+      data: structured_data,
+      is_error: Map.get(block, :is_error, false)
+    }
+
+    result = Middleware.run_after_tool_call(run.state, call, original)
+
+    block = %{block | content: bounded_result(result.content, original.content, call, run)}
+
     meta = %{
       id: call[:id],
       name: call[:name],
       input: call[:input] || %{},
       duration_ms: max(System.monotonic_time(:millisecond) - started.started_at, 0),
-      error: error
+      error: result_error(error, original, result)
     }
 
     end_seq = emit_end(meta, start_seq, run)
@@ -316,9 +342,22 @@ defmodule Alloy.Tool.Executor do
         start_event_seq: start_seq,
         end_event_seq: end_seq
       })
-      |> maybe_put_structured_data(structured_data)
+      |> maybe_put_structured_data(result.data)
 
     {started.index, {block, meta}}
+  end
+
+  defp result_error(nil, _original, _result), do: nil
+  defp result_error(error, result, result), do: error
+  defp result_error(_error, _original, result), do: result.content
+
+  defp bounded_result(content, content, _call, _run), do: content
+
+  defp bounded_result(content, _original, call, run) do
+    case Map.fetch(run.tool_fns, call[:name]) do
+      {:ok, tool} -> maybe_truncate(valid_text(content), Registry.to_inline(tool))
+      :error -> valid_text(content)
+    end
   end
 
   # Tool output is sent back to the provider as JSON on every later turn.

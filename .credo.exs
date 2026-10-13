@@ -18,8 +18,16 @@
     %{
       name: "default",
       files: %{
-        included: ["lib/", "test/", "examples/", "checks/", "mix.exs", ".credo.exs"],
-        excluded: [~r"/_build/", ~r"/deps/"]
+        included: [
+          "lib/",
+          "test/",
+          "examples/",
+          "checks/",
+          "benchmarks/",
+          "mix.exs",
+          ".credo.exs"
+        ],
+        excluded: [~r"/_build/", ~r"/deps/", ~r"/node_modules/"]
       },
       plugins: [],
       requires: [],
@@ -85,7 +93,8 @@
           {Credo.Check.Refactor.FilterFilter, []},
           {Credo.Check.Refactor.FilterReject, []},
           {Credo.Check.Refactor.FunctionArity, []},
-          {Credo.Check.Refactor.IoPuts, []},
+          # Benchmark entry points emit their machine-readable results on stdout.
+          {Credo.Check.Refactor.IoPuts, [files: %{excluded: ["benchmarks/"]}]},
           {Credo.Check.Refactor.LongQuoteBlocks, []},
           {Credo.Check.Refactor.MapJoin, []},
           {Credo.Check.Refactor.MapMap, []},

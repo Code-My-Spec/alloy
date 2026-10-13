@@ -297,22 +297,18 @@ defmodule Alloy.Provider.Gemini do
     end)
   end
 
-  defp normalize_function_response_payload(content, is_error) do
-    payload =
-      case Jason.decode(content) do
-        {:ok, decoded} when is_map(decoded) -> decoded
-        {:ok, decoded} -> %{"result" => decoded}
-        {:error, _} -> %{"content" => content}
-      end
-
-    if is_error, do: Map.put(payload, "is_error", true), else: payload
-  end
+  # Keep the tool's text intact, including JSON-looking text. Gemini recognizes
+  # output/error envelopes; decoding arbitrary tool text changes its framing.
+  defp normalize_function_response_payload(content, false), do: %{"output" => content}
+  defp normalize_function_response_payload(content, true), do: %{"error" => content}
 
   defp format_tool_def(%{name: name, description: desc, input_schema: schema}) do
     %{
       "name" => name,
       "description" => desc,
-      "parameters" => Alloy.Provider.stringify_keys(schema)
+      # JSON Schema keywords such as additionalProperties are not accepted by
+      # Gemini's older OpenAPI-shaped parameters field.
+      "parametersJsonSchema" => Alloy.Provider.stringify_keys(schema)
     }
   end
 

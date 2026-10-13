@@ -7,7 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Gemini preserves tool-result text inside explicit `output`/`error` envelopes
+  rather than decoding JSON-looking text into arbitrary response fields. Public
+  tool results and transcripts retain their original content and error status.
+
+- Tool argument edits now pass through later `:before_tool_call` middleware.
+  Previously the first edit ended the chain. Block and halt still stop it.
+- `:before_completion` now runs before automatic compaction, so prepared
+  messages, tools, and model limits apply to the request's context budget.
+
+### Loop controls
+
+- `:after_tool_call` middleware can replace each result's content and structured
+  data before publication, while preserving success/error status.
+- Opt-in `tool_validation: :schema` validates arguments using the optional
+  `ex_json_schema` dependency (drafts 4/6/7, local references, no coercion).
+  The default remains object/required-key validation.
+- `stop_after_tool: "name"` completes successfully after a matching successful
+  call and the rest of its round settle. `result.text` is the selected output;
+  `result.metadata.final_tool` includes its ID, name, and structured data.
+- `Alloy.Agent.State.prepare/2` prepares messages, tools, system prompt, and
+  provider through existing middleware, rebuilding definitions and model limits.
+- `Alloy.Transcript.validate/1` checks client tool pairing; `repair/1` explicitly
+  supplies interrupted outcomes only where a result is missing.
+- `tool_concurrency:` caps parallel tool execution without changing sequential
+  tool barriers. The default remains the scheduler count.
+
+### Performance
+
+- Reuse resolved tool schemas across agent turns when their input schemas are
+  unchanged. Schema changes are checked before execution; cache entries remain
+  bounded to the active tool set and never appear in result/session metadata.
+
 ### Fixed
+
+- Gemini tools use `parametersJsonSchema` so valid JSON Schema keywords such as
+  `additionalProperties` are accepted by the API instead of producing HTTP 400.
 
 - Compaction summary requests omit thinking and redacted thinking blocks,
   including string-keyed blocks, while preserving visible text and tool evidence.
