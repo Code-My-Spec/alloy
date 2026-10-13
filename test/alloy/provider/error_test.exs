@@ -46,9 +46,10 @@ defmodule Alloy.Provider.ErrorTest do
       for code <- [
             "insufficient_quota",
             "project_spend_limit_exceeded",
-            "credit_balance_exhausted"
+            "credit_balance_exhausted",
+            "subscription_sharing_usage_limit_exceeded"
           ] do
-        error = Error.from_response(429, %{}, openai("insufficient_quota", code, "pay up"))
+        error = Error.from_response(429, %{}, openai("rate_limit_error", code, "pay up"))
         assert error.kind == :quota
         refute Error.retryable?(error)
       end
@@ -139,9 +140,28 @@ defmodule Alloy.Provider.ErrorTest do
       assert Error.from_response(429, headers, "").retry_after_ms == 1_500
     end
 
-    test "ignores the HTTP-date form" do
-      headers = %{"retry-after" => ["Wed, 21 Oct 2026 07:28:00 GMT"]}
-      assert Error.from_response(503, headers, "").retry_after_ms == nil
+    test "reads future HTTP dates and clamps past dates to zero" do
+      future = DateTime.add(DateTime.utc_now(), 60, :second)
+      headers = %{"retry-after" => [Calendar.strftime(future, "%a, %d %b %Y %H:%M:%S GMT")]}
+      assert Error.from_response(503, headers, "").retry_after_ms in 58_000..60_000
+
+      past = %{"retry-after" => ["Wed, 21 Oct 2015 07:28:00 GMT"]}
+      assert Error.from_response(503, past, "").retry_after_ms == 0
+    end
+
+    test "ignores invalid durations and dates" do
+      for value <- [
+            "garbage",
+            "-1",
+            "1 second",
+            "Wed, 99 Oct 2026 07:28:00 GMT",
+            "Wed, 29 Feb 2025 07:28:00 GMT",
+            "Wed, 01 Oct 2026 24:28:00 GMT",
+            "Wed, 01 Oct 2026 07:28:00 UTC",
+            "Wed, 01 Oct 2026 07:28:00 GMT\nextra"
+          ] do
+        assert Error.from_response(503, %{"retry-after" => [value]}, "").retry_after_ms == nil
+      end
     end
   end
 

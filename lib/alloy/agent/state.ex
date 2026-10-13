@@ -4,17 +4,22 @@ defmodule Alloy.Agent.State do
 
   Tracks the conversation history, turn count, token usage, and
   current status. Passed through each iteration of the agent loop.
+
+  `deadline` is the monotonic time in milliseconds (see
+  `System.monotonic_time/1`) by which the run's provider requests must
+  finish; `Alloy.Agent.Turn.run_loop/2` sets it. Middleware that makes its
+  own provider request, as compaction does, should finish by it.
   """
 
   alias Alloy.Agent.Config
   alias Alloy.{Message, Usage}
+  alias Alloy.Tool.Registry
 
-  @type status :: :idle | :running | :completed | :error | :max_turns | :budget_exceeded | :halted
+  @type status :: :idle | :running | :completed | :error | :max_turns | :halted
 
   @type t :: %__MODULE__{
           config: Config.t(),
           messages: [Message.t()],
-          messages_new: [Message.t()],
           turn: non_neg_integer(),
           usage: Usage.t(),
           status: status(),
@@ -23,13 +28,13 @@ defmodule Alloy.Agent.State do
           tool_calls: [map()],
           tool_defs: [map()],
           tool_fns: %{String.t() => Alloy.Tool.Registry.tool()},
+          tool_schema_cache: map(),
           provider_state: map(),
           provider_response_metadata: map(),
           run_metadata: map(),
           started_at: integer() | nil,
-          agent_id: String.t(),
-          current_task: {reference(), pid(), binary()} | nil,
-          pending_requests: term()
+          deadline: integer() | nil,
+          agent_id: String.t()
         }
 
   @enforce_keys [:config]
@@ -38,23 +43,20 @@ defmodule Alloy.Agent.State do
     :error,
     :stop_reason,
     messages: [],
-    # Deprecated: always [] since 0.12.5 (state.messages is the full
-    # history). Kept so code that builds or resets the struct still
-    # compiles; removed in 0.13.
-    messages_new: [],
     turn: 0,
     usage: %Usage{},
     tool_calls: [],
     status: :idle,
     tool_defs: [],
     tool_fns: %{},
+    # Internal, bounded to the latest validated tool set; never part of Result.
+    tool_schema_cache: %{},
     provider_state: %{},
     provider_response_metadata: %{},
     run_metadata: %{},
     started_at: nil,
-    agent_id: "",
-    current_task: nil,
-    pending_requests: :queue.new()
+    deadline: nil,
+    agent_id: ""
   ]
 
   @doc """
@@ -79,15 +81,75 @@ defmodule Alloy.Agent.State do
   end
 
   @doc """
+  Prepares request inputs from `:before_completion` middleware.
+
+  Accepts `:messages`, `:tools`, `:system_prompt`, and `:provider` (the same
+  provider tuple accepted by `Alloy.run/2`). Changes persist for later turns.
+  Tools and their wire definitions are rebuilt together. Provider changes
+  re-derive model limits and discard previous opaque provider state; pass an
+  explicit `provider_state` in the new provider config to restore it.
+  Run counters, deadlines, usage, and tool history are preserved.
+  """
+  @spec prepare(t(), keyword()) :: t()
+  def prepare(%__MODULE__{} = state, opts) when is_list(opts) do
+    opts = Keyword.validate!(opts, [:messages, :tools, :system_prompt, :provider])
+    config = prepare_config(state.config, opts)
+    {tool_defs, tool_fns} = Registry.build(config.tools)
+    messages = Keyword.get(opts, :messages, state.messages)
+
+    unless is_list(messages) and Enum.all?(messages, &is_struct(&1, Message)) do
+      raise ArgumentError, "messages must be a list of Alloy.Message structs"
+    end
+
+    %{
+      state
+      | config: config,
+        tool_defs: tool_defs,
+        tool_fns: tool_fns,
+        messages: messages,
+        provider_state: prepared_provider_state(state, config),
+        provider_response_metadata:
+          if(provider_changed?(state.config, config),
+            do: %{},
+            else: state.provider_response_metadata
+          )
+    }
+  end
+
+  defp prepare_config(config, opts) do
+    config =
+      case Keyword.fetch(opts, :provider) do
+        {:ok, provider} -> Config.with_provider(config, provider)
+        :error -> config
+      end
+
+    config = %{config | tools: Keyword.get(opts, :tools, config.tools)}
+    prompt = Keyword.get(opts, :system_prompt, config.system_prompt)
+
+    unless is_nil(prompt) or is_binary(prompt),
+      do: raise(ArgumentError, "system_prompt must be a string or nil")
+
+    %{config | system_prompt: prompt}
+  end
+
+  defp prepared_provider_state(state, config) do
+    if provider_changed?(state.config, config),
+      do: Map.get(config.provider_config, :provider_state, %{}),
+      else: state.provider_state
+  end
+
+  defp provider_changed?(old, new),
+    do: old.provider != new.provider or old.provider_config != new.provider_config
+
+  @doc """
   Append messages to the conversation history.
 
   `state.messages` always holds the full history in chronological order,
-  so middleware can read it directly. Messages a caller left in the
-  deprecated `messages_new` accumulator are folded in first.
+  so middleware can read it directly.
   """
   @spec append_messages(t(), [Message.t()] | Message.t()) :: t()
   def append_messages(%__MODULE__{} = state, messages) when is_list(messages) do
-    %{state | messages: messages(state) ++ messages, messages_new: []}
+    %{state | messages: state.messages ++ messages}
   end
 
   def append_messages(%__MODULE__{} = state, %Message{} = message),
@@ -132,33 +194,11 @@ defmodule Alloy.Agent.State do
   end
 
   @doc """
-  Return messages in chronological order.
-
-  Equal to `state.messages`, plus anything left in the deprecated
-  `messages_new` accumulator by code written for Alloy 0.12.4 or earlier.
+  Return the conversation history in chronological order, the same as
+  `state.messages`.
   """
   @spec messages(t()) :: [Message.t()]
-  def messages(%__MODULE__{messages: base, messages_new: []}) do
-    base
-  end
-
-  def messages(%__MODULE__{messages: base, messages_new: new}) do
-    base ++ Enum.reverse(new)
-  end
-
-  @doc deprecated: "state.messages is always complete; read it or call messages/1."
-  @doc """
-  Fold the deprecated `messages_new` accumulator into `state.messages`.
-
-  Alloy no longer fills the accumulator, so this only matters for a state
-  built by hand with a non-empty `messages_new`. Removed in 0.13.
-  """
-  @spec materialize(t()) :: t()
-  def materialize(%__MODULE__{messages_new: []} = state), do: state
-
-  def materialize(%__MODULE__{} = state) do
-    %{state | messages: messages(state), messages_new: []}
-  end
+  def messages(%__MODULE__{messages: messages}), do: messages
 
   @doc """
   Increment the turn counter.
@@ -194,20 +234,11 @@ defmodule Alloy.Agent.State do
   def last_assistant_thinking(%__MODULE__{} = state),
     do: find_last_assistant(state, &Message.thinking/1)
 
-  @doc deprecated: "A state owns no resources; drop the call. Removed in 0.13."
-  @doc """
-  Does nothing and returns `:ok`. A state owns no resources to release;
-  kept only so existing callers compile during 0.12.x.
-  """
-  @spec cleanup(t()) :: :ok
-  def cleanup(%__MODULE__{}), do: :ok
-
   # Newest first, the first assistant message for which `extract` returns a
   # value. Message.text/1 returns "" rather than nil, so text stops at the
   # last assistant message while thinking keeps looking further back.
   defp find_last_assistant(%__MODULE__{} = state, extract) do
-    state
-    |> messages()
+    state.messages
     |> Enum.reverse()
     |> Enum.find_value(fn
       %Message{role: :assistant} = message -> extract.(message)

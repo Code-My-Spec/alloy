@@ -2,21 +2,23 @@ defmodule Alloy.Result do
   @moduledoc """
   Structured result from an agent run.
 
-  Returned by `Alloy.run/2` and `Alloy.Agent.Server.chat/3`.
+  Returned by `Alloy.run/2` and `Alloy.stream/3`.
   Implements `Access` for bracket-syntax compatibility (`result[:text]`).
 
   ## Fields
 
     * `:text` — the text of the last assistant message (see `Alloy.Message.text/1`):
       `""` when that message has no text blocks (it only called tools, or the
-      output was cut off), `nil` only when the conversation has no assistant message
+      output was cut off), `nil` only when the conversation has no assistant message.
+      With `:stop_after_tool`, this is the selected tool's final content instead;
+      its metadata is in `metadata.final_tool`
     * `:thinking` — the final assistant thinking/reasoning text (or `nil` if none),
       so callers need not dig it out of the last message's content blocks
     * `:messages` — full conversation history
     * `:usage` — accumulated `%Alloy.Usage{}` token counts
     * `:tool_calls` — list of tool execution metadata maps
     * `:metadata` — auxiliary result metadata such as provider-owned state
-    * `:status` — final run status (`:completed`, `:max_turns`, `:budget_exceeded`, `:error`, `:halted`)
+    * `:status` — final run status (`:completed`, `:max_turns`, `:error`, `:halted`)
     * `:stop_reason` — why the model stopped on the last provider response
       (`:end_turn`, `:tool_use`, `:max_tokens`, `:refusal`, `:pause_turn`), or
       `nil` if no response arrived. Check for `:max_tokens` to detect a
@@ -69,7 +71,7 @@ defmodule Alloy.Result do
   @spec from_state(State.t()) :: t()
   def from_state(%State{} = state) do
     %__MODULE__{
-      text: State.last_assistant_text(state),
+      text: final_text(state),
       thinking: State.last_assistant_thinking(state),
       messages: State.messages(state),
       usage: state.usage,
@@ -83,12 +85,10 @@ defmodule Alloy.Result do
   end
 
   @doc """
-  Tags a result the way `Alloy.run/2` and `Alloy.Agent.Server.chat/3`
-  return it.
+  Tags a result the way `Alloy.run/2` returns it.
 
   `{:ok, result}` when the run completed or stopped at `:max_turns`;
-  `{:error, result}` for every other status (`:error`, `:halted`,
-  `:budget_exceeded`).
+  `{:error, result}` for every other status (`:error`, `:halted`).
   """
   @spec wrap(t()) :: {:ok, t()} | {:error, t()}
   def wrap(%__MODULE__{status: status} = result) when status in [:completed, :max_turns],
@@ -114,8 +114,14 @@ defmodule Alloy.Result do
     %{}
     |> maybe_put_metadata(:provider_state, state.provider_state)
     |> maybe_put_metadata(:provider_response, state.provider_response_metadata)
-    |> maybe_put_metadata(:run, state.run_metadata)
+    |> maybe_put_metadata(:run, Map.delete(state.run_metadata, :final_tool))
+    |> maybe_put_metadata(:final_tool, Map.get(state.run_metadata, :final_tool, %{}))
   end
+
+  defp final_text(%State{status: :completed, run_metadata: %{final_tool: %{content: content}}}),
+    do: content
+
+  defp final_text(state), do: State.last_assistant_text(state)
 
   defp maybe_put_metadata(metadata, _key, value) when is_map(value) and map_size(value) == 0,
     do: metadata

@@ -7,7 +7,14 @@ defmodule Alloy.Provider.RetryTest do
 
   describe "retryable?/1 with Alloy.Provider.Error" do
     test "retries transient kinds" do
-      for kind <- [:rate_limited, :overloaded, :server_error, :timeout, :network] do
+      for kind <- [
+            :rate_limited,
+            :overloaded,
+            :server_error,
+            :timeout,
+            :network,
+            :malformed_reply
+          ] do
         assert Retry.retryable?(%Error{kind: kind, message: "x"})
       end
     end
@@ -185,6 +192,21 @@ defmodule Alloy.Provider.RetryTest do
   end
 
   describe "call_with_retry/6 with structured errors" do
+    test "malformed replies retry within the configured attempt limit" do
+      error = %Error{kind: :malformed_reply, message: "empty tool_use"}
+      provider = scripted_provider([{:error, error}, :ok])
+      state = build_state(retry_config(max_retries: 1, retry_backoff_ms: 1))
+      deadline = System.monotonic_time(:millisecond) + 5_000
+
+      assert {:ok, _} =
+               Retry.call_with_retry(state, provider, %{}, false, fn _ -> :ok end, deadline)
+
+      provider = scripted_provider([{:error, error}, {:error, error}, :ok])
+
+      assert {:error, ^error} =
+               Retry.call_with_retry(state, provider, %{}, false, fn _ -> :ok end, deadline)
+    end
+
     test "waits at least retry_after_ms before retrying" do
       rate_limited = %Error{kind: :rate_limited, message: "slow", retry_after_ms: 150}
       provider = scripted_provider([{:error, rate_limited}, :ok])
@@ -199,7 +221,15 @@ defmodule Alloy.Provider.RetryTest do
     end
 
     test "gives up at once when retry_after_ms would overshoot the deadline" do
-      rate_limited = %Error{kind: :rate_limited, message: "slow", retry_after_ms: 60_000}
+      retry_at = DateTime.add(DateTime.utc_now(), 60, :second)
+
+      rate_limited =
+        Error.from_response(
+          429,
+          %{"retry-after" => [Calendar.strftime(retry_at, "%a, %d %b %Y %H:%M:%S GMT")]},
+          "slow"
+        )
+
       provider = scripted_provider([{:error, rate_limited}, :ok])
       state = build_state(retry_config(max_retries: 3, retry_backoff_ms: 1))
       deadline = System.monotonic_time(:millisecond) + 2_000
@@ -212,7 +242,15 @@ defmodule Alloy.Provider.RetryTest do
     end
 
     test "does not retry a quota error" do
-      quota = %Error{kind: :quota, status: 429, message: "insufficient_quota"}
+      quota =
+        Error.from_response(429, %{}, %{
+          "error" => %{
+            "type" => "rate_limit_error",
+            "code" => "subscription_sharing_usage_limit_exceeded",
+            "message" => "quota exhausted"
+          }
+        })
+
       provider = scripted_provider([{:error, quota}, :ok])
       state = build_state(retry_config(max_retries: 3, retry_backoff_ms: 1))
       deadline = System.monotonic_time(:millisecond) + 10_000

@@ -6,8 +6,8 @@ on:
       - "v*"
 
 env:
-  ELIXIR_VERSION: "1.20"
-  OTP_VERSION: "28"
+  ELIXIR_VERSION: "1.20.4"
+  OTP_VERSION: "28.5.0.7"
 
 jobs:
   test:
@@ -34,10 +34,14 @@ jobs:
           restore-keys: ${{ runner.os }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - run: mix deps.get
-      - run: mix compile --warnings-as-errors
-      - run: mix test
-      - run: mix format --check-formatted
-      - run: mix credo --strict
+      - name: Verify release tag matches package version
+        run: >-
+          mix run --no-start -e
+          'expected = "v" <> Mix.Project.config()[:version];
+          unless System.fetch_env!("GITHUB_REF_NAME") == expected,
+          do: raise("Release tag must match package version: #{expected}")'
+      - run: mix ci
+      - run: MIX_ENV=dev mix docs --warnings-as-errors
 
   publish:
     name: Publish to Hex.pm

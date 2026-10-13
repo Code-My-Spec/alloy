@@ -19,10 +19,10 @@ defmodule Alloy.Provider.Error do
   ## Kinds
 
     * retried: `:rate_limited`, `:overloaded`, `:server_error`, `:timeout`,
-      `:network`
+      `:network`, `:malformed_reply`
     * not retried: `:context_overflow` (the loop compacts once instead),
       `:quota` (billing or spend limit), `:auth`, `:invalid_request`,
-      `:unknown`
+      `:session_uncertain` (a persisted CLI turn may have been recorded), `:unknown`
   """
 
   @type kind ::
@@ -31,6 +31,8 @@ defmodule Alloy.Provider.Error do
           | :server_error
           | :timeout
           | :network
+          | :malformed_reply
+          | :session_uncertain
           | :context_overflow
           | :quota
           | :auth
@@ -48,7 +50,7 @@ defmodule Alloy.Provider.Error do
 
   defexception [:message, :status, :type, :code, :retry_after_ms, kind: :unknown]
 
-  @retryable [:rate_limited, :overloaded, :server_error, :timeout, :network]
+  @retryable [:rate_limited, :overloaded, :server_error, :timeout, :network, :malformed_reply]
 
   # Error `code` or `type` values from Anthropic, OpenAI, Gemini and xAI.
   # Codes are checked before types because they are more specific (OpenAI
@@ -73,7 +75,7 @@ defmodule Alloy.Provider.Error do
     "PERMISSION_DENIED" => :auth
   }
 
-  @quota_labels ~w(insufficient_quota billing_hard_limit_reached credit_balance_exhausted)
+  @quota_labels ~w(insufficient_quota billing_hard_limit_reached credit_balance_exhausted subscription_sharing_usage_limit_exceeded)
 
   @overflow_phrases [
     "prompt is too long",
@@ -224,13 +226,44 @@ defmodule Alloy.Provider.Error do
 
   # ── Retry-After ───────────────────────────────────────────────────────────
 
-  # OpenAI sends `retry-after-ms`; everyone else sends `retry-after` in
-  # seconds. The HTTP-date form is ignored, so normal backoff applies.
   defp retry_after_ms(headers) do
     case {header(headers, "retry-after-ms"), header(headers, "retry-after")} do
-      {ms, _} when is_binary(ms) -> parse_duration(ms, 1)
-      {nil, seconds} when is_binary(seconds) -> parse_duration(seconds, 1_000)
-      _ -> nil
+      {ms, _} when is_binary(ms) ->
+        parse_duration(ms, 1)
+
+      {nil, value} when is_binary(value) ->
+        parse_duration(value, 1_000) || parse_retry_date(value)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_retry_date(value) do
+    case http_date(String.trim(value)) do
+      {:ok, datetime} -> max(DateTime.diff(datetime, DateTime.utc_now(), :millisecond), 0)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp http_date(value) do
+    pattern =
+      ~r/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (\d{2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{4}) (\d{2}:\d{2}:\d{2}) GMT$/
+
+    case Regex.run(pattern, value) do
+      [_full, day, month, year, time] ->
+        month =
+          Enum.find_index(~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec), &(&1 == month)) + 1
+
+        iso = "#{year}-#{String.pad_leading(Integer.to_string(month), 2, "0")}-#{day}T#{time}Z"
+
+        case DateTime.from_iso8601(iso) do
+          {:ok, datetime, 0} -> {:ok, datetime}
+          {:error, reason} -> {:error, reason}
+        end
+
+      _other ->
+        {:error, :invalid_format}
     end
   end
 

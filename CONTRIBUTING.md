@@ -57,10 +57,16 @@ mix deps.unlock --check-unused # No stale lockfile entries
 mix hex.audit                  # No retired packages or security advisories
 mix compile --warnings-as-errors --force  # Includes Elixir 1.20 type warnings
 mix xref graph --format cycles --label compile-connected --fail-above 0
-mix credo                      # strict: true, see .credo.exs for the policy
+mix credo --strict             # See .credo.exs for the policy
 mix test --warnings-as-errors --cover    # Coverage floor in mix.exs
 mix dialyzer                   # With :unmatched_returns, :missing_return, ...
 ```
+
+Formatter and Credo checks cover library code, tests, examples, checks, and
+Elixir benchmark scripts. Benchmark entry points may write results to stdout;
+other lint checks apply unchanged. Use the standard Elixir formatter, explicit
+public API specs, behaviours for extension points, and supervised tasks for
+concurrent tool execution. Keep application orchestration outside the library.
 
 Docs must also build cleanly: `MIX_ENV=dev mix docs --warnings-as-errors`.
 
