@@ -214,7 +214,11 @@ defmodule Alloy.Context.CompactorTest do
           max_tokens: 250,
           compaction: [reserve_tokens: 25, keep_recent_tokens: 20],
           provider: ProbeProvider,
-          provider_config: %{summary_response: {:ok, summary_text("Alpha")}, test_pid: self()},
+          provider_config: %{
+            summary_response: {:ok, summary_text("Alpha")},
+            test_pid: self(),
+            persist_session: true
+          },
           provider_state: %{response_id: "should-not-leak"}
         )
 
@@ -224,11 +228,43 @@ defmodule Alloy.Context.CompactorTest do
       assert prompt =~ "<conversation>"
       assert prompt =~ "## Goal"
       refute Map.has_key?(config, :provider_state)
+      refute Map.has_key?(config, :persist_session)
 
       assert hd(compacted.messages).content == "original request"
       assert Enum.at(compacted.messages, 1).role == :user
       assert summary_message?(Enum.at(compacted.messages, 1))
       assert Enum.at(compacted.messages, 1).content =~ "Alpha goal"
+    end
+
+    test "summary input excludes reasoning but retains visible text and tool evidence" do
+      blocks = [
+        %{type: "thinking", thinking: "private-reasoning", signature: "private-signature"},
+        %{type: "redacted_thinking", data: "private-redacted"},
+        %{"type" => "thinking", "thinking" => "private-string-reasoning"},
+        %{"type" => "redacted_thinking", "data" => "private-string-redacted"},
+        %{type: "text", text: "visible-decision " <> String.duplicate("a", 900)},
+        %{type: "tool_use", id: "call-1", name: "read", input: %{path: "evidence.txt"}}
+      ]
+
+      messages = [
+        Message.user("original request"),
+        %Message{role: :assistant, content: blocks},
+        %Message{
+          role: :user,
+          content: [%{type: "tool_result", tool_use_id: "call-1", content: "visible-evidence"}]
+        },
+        Message.user("middle question"),
+        Message.assistant("recent reply"),
+        Message.user("latest")
+      ]
+
+      state = small_budget_state(messages)
+      assert {:compacted, _compacted} = Compactor.maybe_compact(state)
+      assert_received {:summary_request, [%Message{content: prompt}], [], _config}
+      refute prompt =~ "private-"
+      assert prompt =~ "visible-decision"
+      assert prompt =~ "evidence.txt"
+      assert prompt =~ "visible-evidence"
     end
 
     test "uses custom summary prompts from compaction config" do

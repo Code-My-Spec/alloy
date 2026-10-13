@@ -101,6 +101,8 @@ defmodule Alloy.MixProject do
         "docs/provider-compatibility.md",
         "docs/recipes/sub-agents.md",
         "docs/recipes/mcp-tools.md",
+        "docs/recipes/code-mode.md",
+        "docs/recipes/output-capture.md",
         "livebooks/quickstart.livemd"
       ],
       groups_for_extras: [

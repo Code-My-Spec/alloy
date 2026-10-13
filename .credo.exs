@@ -18,7 +18,7 @@
     %{
       name: "default",
       files: %{
-        included: ["lib/", "test/", "mix.exs", ".credo.exs"],
+        included: ["lib/", "test/", "examples/", "checks/", "mix.exs", ".credo.exs"],
         excluded: [~r"/_build/", ~r"/deps/"]
       },
       plugins: [],

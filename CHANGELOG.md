@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Compaction summary requests omit thinking and redacted thinking blocks,
+  including string-keyed blocks, while preserving visible text and tool evidence.
+- Subscription-sharing quota exhaustion is not retried as transient throttling.
+- Provider retries honor HTTP-date `Retry-After` headers as well as numeric delays.
+- Codex `tool_use` replies with no calls return a typed `:malformed_reply`
+  failure, retried within the existing attempt/deadline budget on fresh calls. Text accompanying
+  an empty call list is never silently treated as completed work.
+
+### Added
+
+- Opt-in Codex continuation with `persist_session: true`. The default remains
+  ephemeral. Continuation fingerprints the serialized transcript rather than
+  loop-added provenance, and starts fresh when execution configuration or
+  earlier history changes. Failed resumes return non-retryable `:session_uncertain`.
+  Hosts can change `:session_generation` after failure/cancellation to recover
+  without losing Alloy history. Continuation metadata is JSON-safe.
+- Codex streams the last validated structured answer at `turn.completed`, before process exit,
+  keeping command diagnostics and commentary out of answer text. Final-response
+  disagreement is an error; callbacks run in the caller and cancellation stops
+  the subprocess tree.
+- Tested host-only recipes for bounded producer-side output capture and nested
+  tool execution. No scripting runtime, file store, or Claude adapter is added
+  to Alloy's core or runtime dependencies.
+
+### Changed
+
+- Release publication now requires the full `mix ci` gate, warning-free docs,
+  and a tag matching the package version.
+
 ## [0.12.5] - 2026-10-09
 
 ### Security

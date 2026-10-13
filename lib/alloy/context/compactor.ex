@@ -591,6 +591,7 @@ defmodule Alloy.Context.Compactor do
       state.config.provider_config
       |> Map.delete(:provider_state)
       |> Map.delete("provider_state")
+      |> Map.delete(:persist_session)
       |> Map.put(
         :system_prompt,
         Map.get(
@@ -763,6 +764,7 @@ defmodule Alloy.Context.Compactor do
 
   defp serialize_message(%Message{role: role, content: blocks}) when is_list(blocks) do
     blocks
+    |> Enum.reject(&thinking_block?/1)
     |> Enum.map(&serialize_block(role, &1))
     |> Enum.reject(&(&1 == ""))
     |> Enum.join("\n")
@@ -770,10 +772,6 @@ defmodule Alloy.Context.Compactor do
 
   defp serialize_block(role, %{type: "text", text: text}) when is_binary(text) do
     "[#{role_label(role)}]\n#{text}"
-  end
-
-  defp serialize_block(:assistant, %{type: "thinking", thinking: text}) when is_binary(text) do
-    "[Assistant thinking]\n#{text}"
   end
 
   defp serialize_block(:assistant, %{type: type, name: name, input: input})

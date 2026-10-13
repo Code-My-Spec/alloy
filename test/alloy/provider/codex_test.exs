@@ -1,10 +1,404 @@
 defmodule Alloy.Provider.CodexTest do
   use ExUnit.Case, async: true
 
+  alias Alloy.Agent.{Config, State, Turn}
   alias Alloy.Message
-  alias Alloy.Provider.{Codex, Error}
+  alias Alloy.Provider.{Codex, Error, Retry}
+
+  describe "opt-in continuation" do
+    test "the agent loop resumes after executing a tool" do
+      parent = self()
+
+      tool =
+        Alloy.Tool.inline(
+          name: "echo",
+          description: "Echo a value",
+          input_schema: %{type: "object", properties: %{}, additionalProperties: false},
+          execute: fn _input, _context -> {:ok, "tool-evidence"} end
+        )
+
+      runner =
+        fake_runner(fn args, _opts, path ->
+          resumed? = Enum.take(args, 2) == ["exec", "resume"]
+          send(parent, {:loop_call, resumed?, List.last(args)})
+
+          payload =
+            if resumed? do
+              %{stop_reason: "end_turn", text: "completed", tool_calls: []}
+            else
+              %{
+                stop_reason: "tool_use",
+                text: "",
+                tool_calls: [%{call_id: "call-1", name: "echo", arguments_json: "{}"}]
+              }
+            end
+
+          File.write!(path, Jason.encode!(payload))
+          ~s({"type":"thread.started","thread_id":"thread-1"}\n)
+        end)
+
+      config =
+        Config.from_opts(
+          provider:
+            {Codex,
+             %{
+               model: "test-model",
+               persist_session: true,
+               workdir: System.tmp_dir!(),
+               command_runner: runner
+             }},
+          tools: [tool],
+          max_turns: 2
+        )
+
+      result =
+        config
+        |> State.init([Message.user("initial-task")])
+        |> Turn.run_loop()
+
+      assert result.status == :completed
+      assert result.turn == 2
+      assert_receive {:loop_call, false, _prompt}
+      assert_receive {:loop_call, true, prompt}
+      assert prompt =~ "tool-evidence"
+      refute prompt =~ "initial-task"
+    end
+
+    defp session_config do
+      parent = self()
+
+      %{
+        model: "test-model",
+        persist_session: true,
+        workdir: System.tmp_dir!(),
+        command_runner:
+          fake_runner(fn args, _opts, output_path ->
+            send(parent, {:invocation, args})
+
+            File.write!(
+              output_path,
+              ~s({"stop_reason":"end_turn","text":"first-reply","tool_calls":[]})
+            )
+
+            ~s({"type":"thread.started","thread_id":"thread-1"}\n)
+          end)
+      }
+    end
+
+    test "restored continuation state merges and saves without duplicate JSON keys" do
+      config = session_config()
+      messages = [Message.user("original")]
+      assert {:ok, first} = Codex.complete(messages, [], config)
+      assert_receive {:invocation, _args}
+      restored = first.provider_state |> Jason.encode!() |> Jason.decode!()
+      history = messages ++ first.messages ++ [Message.user("next")]
+
+      state =
+        Config.from_opts(provider: {Codex, Map.put(config, :provider_state, restored)})
+        |> State.init(history)
+        |> Turn.run_loop()
+
+      assert state.status == :completed
+      assert_receive {:invocation, ["exec", "resume" | _rest]}
+      saved = state.provider_state |> Jason.encode!(maps: :strict) |> Jason.decode!()
+      assert saved["codex_session"]["count"] == length(history) + 1
+      config = Map.put(config, :provider_state, saved)
+
+      assert {:ok, _result} =
+               Codex.complete(state.messages ++ [Message.user("third")], [], config)
+
+      assert_receive {:invocation, ["exec", "resume" | _rest] = args}
+      assert List.last(args) =~ "third"
+      refute List.last(args) =~ "next"
+      refute List.last(args) =~ "original"
+
+      cleared =
+        Config.from_opts(provider: {Codex, Map.put(config, :persist_session, false)})
+        |> State.init(state.messages ++ [Message.user("ephemeral")])
+        |> Turn.run_loop()
+
+      assert_receive {:invocation, args}
+      assert "--ephemeral" in args
+
+      assert cleared.provider_state |> Jason.encode!(maps: :strict) |> Jason.decode!() == %{
+               "codex_session" => nil
+             }
+    end
+
+    test "resumes only the new wire history and ignores loop-added provenance" do
+      config = session_config()
+      initial = [Message.user("original-input")]
+      assert {:ok, first} = Codex.complete(initial, [], config)
+      assert_receive {:invocation, fresh_args}
+      refute "--ephemeral" in fresh_args
+
+      stamped =
+        Enum.map(
+          first.messages,
+          &Map.merge(&1, %{provider: Codex, model: "test-model", origin: "same-origin"})
+        )
+
+      history = initial ++ stamped ++ [Message.user("new-input")]
+      config = Map.put(config, :provider_state, first.provider_state)
+      assert {:ok, resumed} = Codex.complete(history, [], config)
+      assert_receive {:invocation, ["exec", "resume" | _rest] = args}
+      assert "thread-1" in args
+      assert List.last(args) =~ "new-input"
+      refute List.last(args) =~ "original-input"
+      assert resumed.response_metadata.session.mode == :resumed
+    end
+
+    test "rewritten history or changed execution configuration starts fresh" do
+      config = session_config()
+      initial = [Message.user("original-input")]
+      assert {:ok, first} = Codex.complete(initial, [], config)
+      assert_receive {:invocation, _args}
+      history = initial ++ first.messages ++ [Message.user("next")]
+      config = Map.put(config, :provider_state, first.provider_state)
+
+      for changed <- [
+            Map.put(config, :model, "other-model"),
+            Map.put(config, :system_prompt, "changed"),
+            Map.put(config, :codex_home, "/other-home"),
+            Map.put(config, :workdir, File.cwd!()),
+            Map.put(config, :codex_bin, "/other-executable"),
+            Map.put(config, :config_overrides, [~s(model_reasoning_effort="low")])
+          ] do
+        assert {:ok, result} = Codex.complete(history, [], changed)
+        assert_receive {:invocation, args}
+        refute "resume" in args
+        assert result.response_metadata.session.mode == :fresh
+      end
+
+      tools = [%{name: "new-tool", description: "Changed tool", input_schema: %{type: "object"}}]
+      assert {:ok, result} = Codex.complete(history, tools, config)
+      assert_receive {:invocation, args}
+      refute "resume" in args
+      assert result.response_metadata.session.mode == :fresh
+
+      assert {:ok, _result} =
+               Codex.complete([Message.user("rewritten")] ++ tl(history), [], config)
+
+      assert_receive {:invocation, args}
+      refute "resume" in args
+    end
+
+    test "default and profile calls remain ephemeral and clear continuation state" do
+      for config <- [
+            Map.delete(session_config(), :persist_session),
+            Map.put(session_config(), :profile, "custom")
+          ] do
+        assert {:ok, result} = Codex.complete([Message.user("hello")], [], config)
+        assert_receive {:invocation, args}
+        assert "--ephemeral" in args
+        assert result.provider_state == %{"codex_session" => nil}
+      end
+    end
+
+    test "a missing thread id clears a previous continuation" do
+      config = %{
+        session_config()
+        | command_runner:
+            fake_runner(fn _args, _opts, path ->
+              File.write!(path, ~s({"stop_reason":"end_turn","text":"ok","tool_calls":[]}))
+              ""
+            end)
+      }
+
+      assert {:ok, result} = Codex.complete([Message.user("hello")], [], config)
+      assert result.provider_state == %{"codex_session" => nil}
+    end
+
+    test "persistent sessions require a stable working directory" do
+      config = Map.delete(session_config(), :workdir)
+
+      assert {:error, %Error{kind: :invalid_request}} =
+               Codex.complete([Message.user("hello")], [], config)
+
+      refute_received {:invocation, _args}
+    end
+
+    test "a failed resume is returned without automatically resending the full transcript" do
+      config = session_config()
+      messages = [Message.user("original")]
+      assert {:ok, first} = Codex.complete(messages, [], config)
+      assert_receive {:invocation, _args}
+      parent = self()
+
+      runner =
+        fake_runner(fn args, _opts, _path ->
+          send(parent, {:failed_resume, args})
+          {~s({"type":"error","message":"thread not found"}\n), 1}
+        end)
+
+      config =
+        config
+        |> Map.put(:provider_state, first.provider_state)
+        |> Map.put(:command_runner, runner)
+
+      assert {:error, %Error{kind: :session_uncertain}} =
+               Codex.complete(messages ++ first.messages ++ [Message.user("next")], [], config)
+
+      assert_receive {:failed_resume, ["exec", "resume" | _rest]}
+      refute_received {:failed_resume, _args}
+    end
+
+    test "a malformed resume is not retried against the same thread" do
+      config = session_config()
+      messages = [Message.user("original")]
+      assert {:ok, first} = Codex.complete(messages, [], config)
+      assert_receive {:invocation, _args}
+      parent = self()
+
+      runner =
+        fake_runner(fn args, _opts, path ->
+          send(parent, {:resume_attempt, args})
+          File.write!(path, ~s({"stop_reason":"tool_use","text":"Done","tool_calls":[]}))
+          ""
+        end)
+
+      config =
+        config
+        |> Map.put(:provider_state, first.provider_state)
+        |> Map.put(:command_runner, runner)
+
+      state =
+        Config.from_opts(provider: {Codex, config}, max_retries: 1, retry_backoff_ms: 1)
+        |> State.init(messages ++ first.messages ++ [Message.user("next")])
+
+      assert {:error, %Error{kind: :session_uncertain} = error} =
+               Retry.call_with_retry(
+                 state,
+                 Codex,
+                 config,
+                 false,
+                 fn _text -> :ok end,
+                 System.monotonic_time(:millisecond) + 5_000
+               )
+
+      refute Error.retryable?(error)
+      assert_receive {:resume_attempt, ["exec", "resume" | _rest]}
+      refute_received {:resume_attempt, _args}
+    end
+
+    test "a new session generation recovers without discarding history" do
+      config = session_config()
+      messages = [Message.user("original")]
+      assert {:ok, first} = Codex.complete(messages, [], config)
+      assert_receive {:invocation, _args}
+
+      config =
+        config
+        |> Map.put(:provider_state, first.provider_state)
+        |> Map.put(:session_generation, "recovered")
+
+      assert {:ok, result} =
+               Codex.complete(messages ++ first.messages ++ [Message.user("next")], [], config)
+
+      assert_receive {:invocation, args}
+      refute "resume" in args
+      assert List.last(args) =~ "original"
+      assert List.last(args) =~ "first-reply"
+      assert result.response_metadata.session.mode == :fresh
+    end
+
+    test "resume enforces read-only after host overrides" do
+      config = Map.put(session_config(), :config_overrides, [~s(sandbox_mode="workspace-write")])
+      messages = [Message.user("original")]
+      assert {:ok, first} = Codex.complete(messages, [], config)
+      assert_receive {:invocation, _args}
+
+      assert {:ok, _result} =
+               Codex.complete(
+                 messages ++ first.messages ++ [Message.user("next")],
+                 [],
+                 Map.put(config, :provider_state, first.provider_state)
+               )
+
+      assert_receive {:invocation, args}
+
+      assert Enum.find_index(args, &(&1 == ~s(sandbox_mode="workspace-write"))) <
+               Enum.find_index(args, &(&1 == ~s(sandbox_mode="read-only")))
+    end
+
+    @tag :tmp_dir
+    test "a resumed subprocess timeout is not retried", %{tmp_dir: dir} do
+      invocations = Path.join(dir, "invocations")
+
+      script =
+        fake_codex!(dir, """
+        if [ -s "#{invocations}" ]; then
+          printf 'x' >> "#{invocations}"
+          sleep 30
+        fi
+        printf 'x' >> "#{invocations}"
+        printf '%s\\n' '{"type":"thread.started","thread_id":"thread-1"}'
+        """)
+
+      config = %{
+        model: "test-model",
+        persist_session: true,
+        workdir: dir,
+        codex_home: dir,
+        codex_bin: script,
+        timeout_ms: 5_000
+      }
+
+      messages = [Message.user("original")]
+      assert {:ok, first} = Codex.complete(messages, [], config)
+
+      config =
+        config |> Map.put(:provider_state, first.provider_state) |> Map.put(:timeout_ms, 500)
+
+      state =
+        Config.from_opts(provider: {Codex, config}, max_retries: 1, retry_backoff_ms: 1)
+        |> State.init(messages ++ first.messages ++ [Message.user("next")])
+
+      assert {:error, %Error{kind: :session_uncertain}} =
+               Retry.call_with_retry(
+                 state,
+                 Codex,
+                 config,
+                 false,
+                 fn _text -> :ok end,
+                 System.monotonic_time(:millisecond) + 5_000
+               )
+
+      assert File.read!(invocations) == "xx"
+    end
+  end
 
   describe "complete/3" do
+    test "empty tool_use is a typed retryable failure even when it contains text" do
+      for text <- ["", "I will do that now", "Done"] do
+        config = %{
+          model: "test-model",
+          command_runner:
+            fake_runner(fn _args, _opts, output_path ->
+              File.write!(
+                output_path,
+                Jason.encode!(%{stop_reason: "tool_use", text: text, tool_calls: []})
+              )
+
+              ""
+            end)
+        }
+
+        assert {:error, %Error{kind: :malformed_reply} = error} =
+                 Codex.complete([Message.user("Work")], [], config)
+
+        assert Error.retryable?(error)
+
+        assert {:error, %Error{kind: :malformed_reply}} =
+                 Codex.stream([Message.user("Work")], [], config, fn chunk ->
+                   send(self(), {:unexpected_chunk, chunk})
+                   :ok
+                 end)
+
+        refute_received {:unexpected_chunk, _}
+      end
+    end
+
     test "returns an end_turn assistant message from Codex JSON output" do
       config = %{
         model: "gpt-5.4",
@@ -743,6 +1137,189 @@ defmodule Alloy.Provider.CodexTest do
   end
 
   describe "stream/4" do
+    @tag :tmp_dir
+    test "large fragmented diagnostic lines do not enter the answer", %{tmp_dir: dir} do
+      script =
+        fake_codex!(dir, """
+        printf '%s' '{"type":"item.completed","item":{"type":"command_execution","output":"'
+        head -c 2097152 /dev/zero | tr '\\000' x
+        printf '%s\\n' '"}}'
+        printf '%s\\n' '#{reply_event("fake ok")}' '{"type":"turn.completed"}'
+        """)
+
+      config = %{model: "test-model", codex_bin: script, codex_home: dir}
+
+      assert {:ok, _result} =
+               Codex.stream([Message.user("hi")], [], config, fn text ->
+                 send(self(), {:answer, text})
+                 :ok
+               end)
+
+      assert_receive {:answer, "fake ok"}
+      refute_received {:answer, _text}
+    end
+
+    @tag :tmp_dir
+    test "only the final structured answer streams at turn completion", %{tmp_dir: dir} do
+      script =
+        fake_codex!(dir, """
+        printf '%s\\n' '#{reply_event("preamble")}'
+        printf '%s\\n' '#{reply_event("fake ok")}'
+        printf '%s\\n' '{"type":"turn.completed"}'
+        """)
+
+      config = %{model: "test-model", codex_bin: script, codex_home: dir}
+
+      assert {:ok, _result} =
+               Codex.stream([Message.user("hi")], [], config, fn text ->
+                 send(self(), {:answer, text})
+                 :ok
+               end)
+
+      assert_receive {:answer, "fake ok"}
+      refute_received {:answer, _text}
+    end
+
+    @tag :tmp_dir
+    test "without turn completion a candidate is not streamed ahead of the final file", %{
+      tmp_dir: dir
+    } do
+      script = fake_codex!(dir, "printf '%s\\n' '#{reply_event("preamble")}'")
+      config = %{model: "test-model", codex_bin: script, codex_home: dir}
+
+      assert {:ok, _result} =
+               Codex.stream([Message.user("hi")], [], config, fn text ->
+                 send(self(), {:answer, text})
+                 :ok
+               end)
+
+      assert_receive {:answer, "fake ok"}
+      refute_received {:answer, _text}
+    end
+
+    @tag :tmp_dir
+    test "the loop never retries a timeout after an answer was emitted", %{tmp_dir: dir} do
+      invocations = Path.join(dir, "invocations")
+
+      script =
+        fake_codex!(dir, """
+        printf 'x' >> "#{invocations}"
+        printf '%s\\n' '#{reply_event("fake ok")}'
+        printf '%s\\n' '{"type":"turn.completed"}'
+        sleep 30
+        """)
+
+      parent = self()
+
+      result =
+        Alloy.stream(
+          "hi",
+          fn text ->
+            send(parent, {:answer, text})
+            :ok
+          end,
+          provider:
+            {Codex, %{model: "test-model", codex_bin: script, codex_home: dir, timeout_ms: 5_000}},
+          max_retries: 2,
+          retry_backoff_ms: 1
+        )
+
+      assert {:error, _reason} = result
+      assert_receive {:answer, "fake ok"}
+      refute_received {:answer, _text}
+      assert File.read!(invocations) == "x"
+    end
+
+    defp reply_event(text) do
+      payload = Jason.encode!(%{stop_reason: "end_turn", text: text, tool_calls: []})
+      Jason.encode!(%{type: "item.completed", item: %{type: "agent_message", text: payload}})
+    end
+
+    @tag :tmp_dir
+    test "streams only a validated answer before exit, in the caller, without replay", %{
+      tmp_dir: dir
+    } do
+      acknowledged = Path.join(dir, "acknowledged")
+      event = reply_event("fake ok")
+      split_at = div(byte_size(event), 2)
+      {first, last} = String.split_at(event, split_at)
+
+      script =
+        fake_codex!(dir, """
+        printf '%s\\n' '{"type":"item.started","item":{"type":"command_execution","command":"secret diagnostic"}}'
+        printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Working..."}}'
+        printf '%s' '#{first}'
+        sleep 0.02
+        printf '%s\\n' '#{last}'
+        printf '%s\\n' '{"type":"turn.completed"}'
+        while [ ! -f "#{acknowledged}" ]; do sleep 0.01; done
+        """)
+
+      caller = self()
+      config = %{model: "test-model", codex_bin: script, codex_home: dir, timeout_ms: 5_000}
+
+      assert {:ok, result} =
+               Codex.stream([Message.user("hi")], [], config, fn text ->
+                 assert self() == caller
+                 send(caller, {:answer, text})
+                 File.write!(acknowledged, "ok")
+                 :ok
+               end)
+
+      assert_receive {:answer, "fake ok"}
+      refute_received {:answer, _text}
+      assert result.messages == [Message.assistant("fake ok")]
+      assert result.response_metadata.command_output =~ "secret diagnostic"
+    end
+
+    @tag :tmp_dir
+    test "a different final reply is an error rather than silently changing streamed text", %{
+      tmp_dir: dir
+    } do
+      script =
+        fake_codex!(
+          dir,
+          "printf '%s\\n' '#{reply_event("different")}' '{\"type\":\"turn.completed\"}'"
+        )
+
+      config = %{model: "test-model", codex_bin: script, codex_home: dir}
+
+      assert {:error, %Error{kind: :malformed_reply}} =
+               Codex.stream([Message.user("hi")], [], config, fn text ->
+                 send(self(), {:answer, text})
+                 :ok
+               end)
+
+      assert_receive {:answer, "different"}
+      refute_received {:answer, _text}
+    end
+
+    @tag :tmp_dir
+    test "callback cancellation stops children and removes temporary files", %{tmp_dir: dir} do
+      pids_path = Path.join(dir, "pids")
+      runs = Path.join(dir, "runs")
+      File.mkdir_p!(runs)
+
+      script =
+        fake_codex!(dir, """
+        sleep 30 &
+        echo "$$ $!" > "#{pids_path}"
+        printf '%s\\n' '#{reply_event("fake ok")}'
+        printf '%s\\n' '{"type":"turn.completed"}'
+        wait
+        """)
+
+      config = %{model: "test-model", codex_bin: script, codex_home: dir, tmp_dir: runs}
+
+      assert catch_throw(
+               Codex.stream([Message.user("hi")], [], config, fn _text -> throw(:cancel) end)
+             ) == :cancel
+
+      pids = await_pids!(pids_path)
+      assert eventually(fn -> Enum.all?(pids, &(not os_alive?(&1))) end)
+      assert File.ls!(runs) == []
+    end
+
     test "replays the final assistant text through the callback" do
       parent = self()
 
