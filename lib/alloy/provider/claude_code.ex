@@ -186,7 +186,7 @@ defmodule Alloy.Provider.ClaudeCode do
         }
       }
     },
-    required: ["stop_reason", "text", "tool_calls"]
+    required: ["stop_reason", "text"]
   }
 
   # Pre-encoded at compile time - the schema is static, no need to
@@ -660,6 +660,19 @@ defmodule Alloy.Provider.ClaudeCode do
       {:ok, content} -> content
       {:error, _reason} -> ""
     end
+  end
+
+  # d5dbfea3: the model occasionally answers end_turn without a `tool_calls`
+  # key at all, which the schema no longer forbids - treat it the same as an
+  # explicit empty list rather than refusing the whole turn.
+  defp parse_payload(
+         %{"stop_reason" => "end_turn", "text" => text} = payload,
+         config,
+         envelope,
+         messages
+       )
+       when is_binary(text) and not is_map_key(payload, "tool_calls") do
+    parse_payload(Map.put(payload, "tool_calls", []), config, envelope, messages)
   end
 
   defp parse_payload(

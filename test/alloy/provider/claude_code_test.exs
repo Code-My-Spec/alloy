@@ -32,6 +32,43 @@ defmodule Alloy.Provider.ClaudeCodeTest do
       assert result.response_metadata.total_cost_usd == 0.001
     end
 
+    # d5dbfea3: setup help streamed a real reply, but after a reconnect the
+    # stored reply read "test" - the model's end_turn answer had omitted
+    # `tool_calls` entirely, which the schema required, so the turn was
+    # rejected as an unexpected payload and a retry got through instead.
+    test "an end_turn reply omitting tool_calls entirely still ends the turn (d5dbfea3)" do
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            {envelope(%{"stop_reason" => "end_turn", "text" => "All set up."}), 0}
+          end)
+      }
+
+      assert {:ok, result} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert result.stop_reason == :end_turn
+      assert result.messages == [Message.assistant("All set up.")]
+    end
+
+    test "an end_turn reply with an explicit empty tool_calls list still ends the turn" do
+      assert {:ok, result} = complete_end_turn("All set up.")
+      assert result.stop_reason == :end_turn
+      assert result.messages == [Message.assistant("All set up.")]
+    end
+
+    test "a tool_use reply omitting tool_calls entirely is still refused" do
+      config = %{
+        model: "claude-sonnet-5",
+        command_runner:
+          fake_runner(fn _args, _opts ->
+            {envelope(%{"stop_reason" => "tool_use", "text" => "doing it"}), 0}
+          end)
+      }
+
+      assert {:error, reason} = ClaudeCode.complete([Message.user("Hi")], [], config)
+      assert reason =~ "unexpected Claude Code response payload"
+    end
+
     # Taken from a real reply: the model's StructuredOutput call held the
     # literal two characters `\n` and rendered as one line.
     test "a reply the model escaped twice arrives with its line breaks" do
