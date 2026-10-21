@@ -537,26 +537,84 @@ defmodule Alloy.Provider.CodexTest do
       assert Exception.message(reason) =~ "tool_calls"
     end
 
-    test "returns a helpful error when arguments_json is not valid JSON" do
-      config = %{
-        model: "gpt-5.4",
-        command_runner:
-          fake_runner(fn _args, _opts, output_path ->
-            payload = %{
-              stop_reason: "tool_use",
-              text: "",
-              tool_calls: [
-                %{call_id: "call_1", name: "search_examples", arguments_json: "{not json}"}
-              ]
-            }
+    test "arguments that do not decode reach the loop as the string Codex sent" do
+      assert {:ok, result} = complete_with_arguments("{not json}")
+      assert result.stop_reason == :tool_use
+      assert [%Message{content: [%{type: "tool_use", input: input}]}] = result.messages
+      assert input =~ "invalid Codex arguments_json"
+      assert input =~ "As sent: {not json}"
+    end
 
-            File.write!(output_path, Jason.encode!(payload))
-            "codex\n#{Jason.encode!(payload)}\n"
-          end)
-      }
+    test "a raw newline inside a string in the arguments is read as escaped" do
+      raw = ~s({"script":"line one\nline two"})
 
-      assert {:error, reason} = Codex.complete([Message.user("Hi")], [], config)
-      assert Exception.message(reason) =~ "arguments_json"
+      assert {:ok, result} = complete_with_arguments(raw)
+
+      assert [%Message{content: [%{input: %{"script" => "line one\nline two"}}]}] =
+               result.messages
+    end
+
+    test "an object the arguments leave open at the end is closed" do
+      raw = ~s({"file_path":"a.ex","new_string":"def a, do: {:ok, 1}")
+
+      assert {:ok, result} = complete_with_arguments(raw)
+
+      assert [%Message{content: [%{input: %{"file_path" => "a.ex", "new_string" => new_string}}]}] =
+               result.messages
+
+      assert new_string == "def a, do: {:ok, 1}"
+    end
+
+    test "an argument left inside an open string is not guessed at" do
+      assert {:ok, result} = complete_with_arguments(~s({"query":"unfinished))
+      assert [%Message{content: [%{input: input}]}] = result.messages
+      assert is_binary(input)
+    end
+
+    test "the model is told its arguments did not decode, and the turn goes on" do
+      parent = self()
+      {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+      runner =
+        fake_runner(fn args, _opts, output_path ->
+          n = Agent.get_and_update(calls, &{&1, &1 + 1})
+          send(parent, {:prompt, n, List.last(args)})
+
+          payload =
+            case n do
+              0 ->
+                %{
+                  stop_reason: "tool_use",
+                  text: "",
+                  tool_calls: [%{call_id: "call_1", name: "echo", arguments_json: "{\"v\":1},{"}]
+                }
+
+              _ ->
+                %{stop_reason: "end_turn", text: "resent", tool_calls: []}
+            end
+
+          File.write!(output_path, Jason.encode!(payload))
+          "codex\n#{Jason.encode!(payload)}\n"
+        end)
+
+      echo =
+        Alloy.Tool.inline(
+          name: "echo",
+          description: "Echo",
+          input_schema: %{type: "object", properties: %{v: %{type: "integer"}}},
+          execute: fn _input, _context -> send(parent, :echo_ran) && {:ok, "ran"} end
+        )
+
+      assert {:ok, result} =
+               Alloy.run("Go",
+                 provider: {Codex, %{model: "gpt-5.4", command_runner: runner}},
+                 tools: [echo]
+               )
+
+      assert result.text == "resent"
+      refute_received :echo_ran
+      assert_received {:prompt, 1, second_prompt}
+      assert second_prompt =~ "must be a JSON object"
     end
 
     test "accepts a parsed payload even if codex exits non-zero" do
@@ -1433,5 +1491,26 @@ defmodule Alloy.Provider.CodexTest do
         Process.sleep(100)
         eventually(fun, attempts - 1)
     end
+  end
+
+  defp complete_with_arguments(arguments_json) do
+    config = %{
+      model: "gpt-5.4",
+      command_runner:
+        fake_runner(fn _args, _opts, output_path ->
+          payload = %{
+            stop_reason: "tool_use",
+            text: "",
+            tool_calls: [
+              %{call_id: "call_1", name: "search_examples", arguments_json: arguments_json}
+            ]
+          }
+
+          File.write!(output_path, Jason.encode!(payload))
+          "codex\n#{Jason.encode!(payload)}\n"
+        end)
+    }
+
+    Codex.complete([Message.user("Hi")], [], config)
   end
 end

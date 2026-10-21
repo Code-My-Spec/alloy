@@ -840,40 +840,116 @@ defmodule Alloy.Provider.Codex do
     end
   end
 
+  # Arguments that still do not decode are not a failed turn. They go to the
+  # loop as the string Codex sent, which the executor answers with "Input for
+  # <tool> must be a JSON object" as that call's result, so the model sees what
+  # it wrote and sends the call again. Nothing runs, and the transcript keeps
+  # the call and its answer, as Codex's own saved thread does. Failing the
+  # turn instead lost it, and on a resumed thread left the session uncertain.
   defp fetch_arguments(map) do
-    with {:ok, json} <- fetch_string(map, "arguments_json"),
-         {:ok, decoded} when is_map(decoded) <- decode_arguments_json(json) do
-      {:ok, decoded}
-    else
-      {:ok, _non_map} -> {:error, "Codex tool call arguments must decode to a JSON object"}
-      {:error, _reason} = err -> err
+    with {:ok, json} <- fetch_string(map, "arguments_json") do
+      case decode_arguments_json(json) do
+        {:ok, decoded} when is_map(decoded) ->
+          {:ok, decoded}
+
+        {:ok, _not_an_object} ->
+          {:ok, "arguments_json is not a JSON object. As sent: " <> json}
+
+        {:error, reason} ->
+          {:ok, reason <> ". As sent: " <> json}
+      end
     end
   end
 
-  # Codex occasionally emits strings containing invalid JSON escape sequences
-  # — most often `\d`, `\s`, `\p`, `\A` from regex source inside code payloads.
-  # Valid single-character JSON escapes after `\` are: " \ / b f n r t u.
-  # If the first decode fails, we double any other `\X` and retry.
+  # Codex writes the arguments as a JSON string inside its JSON reply, and gets
+  # the inner encoding wrong in a few ways, each repaired here when the first
+  # decode fails:
   #
-  # This does NOT help cases where Codex *under-escapes* an otherwise valid
-  # sequence (e.g. emits `\n` when the intent was a literal backslash-n):
-  # Jason decodes that successfully and silently produces wrong data. Fixing
-  # that class of error needs a prompt-level constraint, not a post-hoc patch.
+  # - invalid escapes, most often `\d`, `\s`, `\p`, `\A` from regex source
+  #   inside code (valid single-character escapes after `\` are " \ / b f n r
+  #   t u), doubled into literal backslashes;
+  # - raw newlines, carriage returns and tabs inside a string, from multi-line
+  #   scripts (`unexpected byte ... 0xA`), escaped;
+  # - an object left open at the end (`unexpected end of input`), closed.
+  #
+  # Under-escaping an otherwise valid sequence (`\n` meant as a literal
+  # backslash-n) decodes and is not detectable here.
   defp decode_arguments_json(json) do
     case Jason.decode(json) do
       {:ok, _} = ok ->
         ok
 
       {:error, %Jason.DecodeError{}} ->
-        case json |> repair_backslash_escapes() |> Jason.decode() do
+        repaired =
+          json
+          |> repair_backslash_escapes()
+          |> escape_raw_controls()
+          |> close_open_containers()
+
+        case Jason.decode(repaired) do
           {:ok, _} = ok ->
             ok
 
-          {:error, %Jason.DecodeError{} = error} ->
+          {:error, %Jason.DecodeError{}} ->
+            {:error, %Jason.DecodeError{} = error} = Jason.decode(json)
             {:error, "invalid Codex arguments_json: #{Exception.message(error)}"}
         end
     end
   end
+
+  # Inside a string a raw control character can only mean the escaped one;
+  # outside one it is whitespace and stays.
+  defp escape_raw_controls(json), do: escape_raw_controls(json, false, [])
+
+  defp escape_raw_controls(<<>>, _in_string, acc),
+    do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp escape_raw_controls(<<"\\", c, rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, [<<"\\", c>> | acc])
+
+  defp escape_raw_controls(<<"\"", rest::binary>>, in_string, acc),
+    do: escape_raw_controls(rest, not in_string, ["\"" | acc])
+
+  defp escape_raw_controls(<<"\n", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\n" | acc])
+
+  defp escape_raw_controls(<<"\r", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\r" | acc])
+
+  defp escape_raw_controls(<<"\t", rest::binary>>, true, acc),
+    do: escape_raw_controls(rest, true, ["\\t" | acc])
+
+  defp escape_raw_controls(<<c, rest::binary>>, in_string, acc),
+    do: escape_raw_controls(rest, in_string, [<<c>> | acc])
+
+  # Appends the closers for objects and arrays still open at the end, when the
+  # text does not end inside a string; anything else is left as it is.
+  defp close_open_containers(json) do
+    case open_containers(json, false, []) do
+      {false, [_ | _] = open} -> json <> List.to_string(open)
+      _complete_or_inside_a_string -> json
+    end
+  end
+
+  defp open_containers(<<>>, in_string, open), do: {in_string, open}
+
+  defp open_containers(<<"\\", _c, rest::binary>>, true, open),
+    do: open_containers(rest, true, open)
+
+  defp open_containers(<<"\"", rest::binary>>, in_string, open),
+    do: open_containers(rest, not in_string, open)
+
+  defp open_containers(<<"{", rest::binary>>, false, open),
+    do: open_containers(rest, false, [?} | open])
+
+  defp open_containers(<<"[", rest::binary>>, false, open),
+    do: open_containers(rest, false, [?] | open])
+
+  defp open_containers(<<c, rest::binary>>, false, [c | open]) when c in [?}, ?]],
+    do: open_containers(rest, false, open)
+
+  defp open_containers(<<_c, rest::binary>>, in_string, open),
+    do: open_containers(rest, in_string, open)
 
   # Replace bare backslash sequences that are not valid JSON escapes by
   # doubling the backslash, converting `\X` (invalid) into `\\X` (valid —
