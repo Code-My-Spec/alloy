@@ -198,7 +198,7 @@ defmodule Alloy.Provider.Codex do
            {:ok, payload} <- decode_payload(command_result, config),
            {:ok, result} <- parse_payload(payload, config, command_result),
            :ok <- finish_stream(result, command_result, config) do
-        {:ok, remember_session(result, messages, scope, plan, command_result)}
+        {:ok, remember_session(result, messages, scope, plan, command_result, config)}
       end
       |> session_result(plan)
     end
@@ -259,15 +259,25 @@ defmodule Alloy.Provider.Codex do
 
   defp session_plan(_config, _home, _messages, _scope), do: {:fresh, :ephemeral}
 
+  # A resume happens only when the session scope, which includes the system
+  # prompt and the tools, is unchanged, so the thread already holds both and a
+  # resumed turn sends only the new messages. Sending them again every turn was
+  # most of what each resume appended (~25 KB of ~38 KB), and the copies are
+  # what filled threads to Codex's own compaction. After a compaction, which
+  # can summarise them away, the next turn sends them again.
   defp session_prompt({:resume, _id, count}, messages, tools, config) do
-    "Continue the recorded conversation. Only new transcript messages follow.\n" <>
-      build_prompt(Enum.drop(messages, count), tools, config)
+    if resend_static?(Map.get(config, :provider_state)) do
+      "Continue the recorded conversation. Only new transcript messages follow.\n" <>
+        build_prompt(Enum.drop(messages, count), tools, config)
+    else
+      build_resume_prompt(Enum.drop(messages, count))
+    end
   end
 
   defp session_prompt({:fresh, _reason}, messages, tools, config),
     do: build_prompt(messages, tools, config)
 
-  defp remember_session(result, messages, scope, plan, command_result) do
+  defp remember_session(result, messages, scope, plan, command_result, config) do
     id =
       Enum.find_value(command_result.events, fn
         %{"type" => "thread.started", "thread_id" => id} when is_binary(id) -> id
@@ -285,10 +295,14 @@ defmodule Alloy.Provider.Codex do
       if plan == {:fresh, :ephemeral} do
         %{"codex_session" => nil}
       else
-        CodexSession.remember(
-          wire_history(messages ++ result.messages),
-          scope,
-          id
+        messages
+        |> Kernel.++(result.messages)
+        |> wire_history()
+        |> CodexSession.remember(scope, id)
+        |> CodexSession.note_thread_size(
+          thread_size(command_result),
+          plan,
+          Map.get(config, :provider_state)
         )
       end
 
@@ -1006,6 +1020,32 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
+  # What the thread already has the framing for: the new messages, and the rules
+  # restated briefly, since they cost little and keep the format in view.
+  defp build_resume_prompt(new_messages) do
+    payload = %{conversation: Enum.map(new_messages, &serialize_message/1)}
+
+    """
+    Continue the recorded conversation; only new transcript messages follow. The
+    system prompt and `available_tools` are as you were last given them. Produce
+    exactly one JSON object matching the supplied schema, naming tools from
+    `available_tools` in `tool_calls`.
+
+    Transcript payload:
+    #{Jason.encode!(payload)}
+    """
+  end
+
+  defp resend_static?(state), do: CodexSession.resend_static?(state)
+
+  # Codex's input for the turn, cache included: the size of the thread it replayed.
+  defp thread_size(%{events: events}) do
+    Enum.find_value(events, fn
+      %{"type" => "turn.completed", "usage" => %{"input_tokens" => input}} -> input
+      _event -> nil
+    end)
+  end
+
   defp build_prompt(messages, tool_defs, config) do
     payload = %{
       system_prompt: Map.get(config, :system_prompt),
@@ -1080,10 +1120,22 @@ defmodule Alloy.Provider.Codex do
     session_args(config.alloy_codex_plan) ++
       ["--output-schema", paths.schema_path, "--output-last-message", paths.last_message_path] ++
       user_config_args(config) ++
+      native_tools_off() ++
       Enum.flat_map(Map.get(config, :config_overrides, []), &["-c", &1]) ++
       sandbox_args(config.alloy_codex_plan) ++
       model_args(config) ++ session_id_args(config.alloy_codex_plan)
   end
+
+  # Codex is the model here and the outer loop's tools do the work. Its own
+  # shell answered tool work inside the read-only sandbox (`mix test` died on
+  # `:eperm`, the loop never saw a tool call), and with its other tools on, the
+  # model searched its native registry for the loop's tools, found none, and
+  # said it had none. `code_mode_host` stays on: off, `exec` fails closed with
+  # an error item mid-turn. Before `config_overrides`, so a caller can re-enable.
+  @native_tools ~w(shell_tool unified_exec apps plugins browser_use computer_use
+                   in_app_browser sleep_tool tool_suggest skill_search multi_agent)
+
+  defp native_tools_off, do: Enum.flat_map(@native_tools, &["-c", "features.#{&1}=false"])
 
   defp session_args({:fresh, :ephemeral}),
     do: ~w(exec --json --skip-git-repo-check --ephemeral --ignore-rules --sandbox read-only)

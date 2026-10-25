@@ -41,6 +41,31 @@ defmodule Alloy.Provider.CodexSession do
     end
   end
 
+  @doc """
+  Record the thread's size after a turn, and whether Codex compacted it: a
+  thread that shrank below half its last size was summarised, and the next
+  resumed turn sends the system prompt and tools again.
+  """
+  @spec note_thread_size(map(), non_neg_integer() | nil, plan(), map() | nil) :: map()
+  def note_thread_size(%{"codex_session" => %{} = session} = state, size, plan, previous_state)
+      when is_integer(size) do
+    previous = previous_size(plan, previous_state)
+    compacted? = is_integer(previous) and size < div(previous, 2)
+
+    %{state | "codex_session" => Map.merge(session, %{"size" => size, "resend" => compacted?})}
+  end
+
+  def note_thread_size(state, _size, _plan, _previous_state), do: state
+
+  @doc "Whether the next resumed turn should carry the system prompt and tools again."
+  @spec resend_static?(map() | nil) :: boolean()
+  def resend_static?(%{"codex_session" => %{"resend" => true}}), do: true
+  def resend_static?(_state), do: false
+
+  # Carried across turns in the session map the caller hands back.
+  defp previous_size({:resume, _id, _count}, %{"codex_session" => %{"size" => size}}), do: size
+  defp previous_size(_plan, _previous_state), do: nil
+
   defp valid_id?(id) when is_binary(id),
     do: id != "" and not String.starts_with?(id, "-")
 

@@ -125,6 +125,91 @@ defmodule Alloy.Provider.CodexTest do
              }
     end
 
+    # A sized runner: each turn reports `input_tokens` from `sizes`, in order.
+    defp sized_config(sizes) do
+      parent = self()
+      {:ok, counter} = Agent.start_link(fn -> sizes end)
+
+      %{
+        model: "test-model",
+        persist_session: true,
+        workdir: System.tmp_dir!(),
+        system_prompt: "SYSTEM-PROMPT-MARKER",
+        command_runner:
+          fake_runner(fn args, _opts, output_path ->
+            send(parent, {:invocation, args})
+            size = Agent.get_and_update(counter, fn [h | t] -> {h, t} end)
+            File.write!(output_path, ~s({"stop_reason":"end_turn","text":"ok","tool_calls":[]}))
+
+            ~s({"type":"thread.started","thread_id":"thread-1"}\n) <>
+              ~s({"type":"turn.completed","usage":{"input_tokens":#{size},"output_tokens":1}}\n)
+          end)
+      }
+    end
+
+    @tool %{name: "TOOL_MARKER", description: "d", input_schema: %{"type" => "object"}}
+
+    test "Codex's own tools are off on fresh and resumed turns" do
+      config = sized_config([1_000, 1_100])
+      initial = [Message.user("one")]
+      {:ok, first} = Codex.complete(initial, [@tool], config)
+      assert_receive {:invocation, fresh}
+      assert "features.shell_tool=false" in fresh
+      assert "features.apps=false" in fresh
+
+      history = initial ++ first.messages ++ [Message.user("two")]
+
+      {:ok, _} =
+        Codex.complete(history, [@tool], Map.put(config, :provider_state, first.provider_state))
+
+      assert_receive {:invocation, ["exec", "resume" | _] = resumed}
+      assert "features.unified_exec=false" in resumed
+      assert "features.multi_agent=false" in resumed
+    end
+
+    test "a resumed turn sends only the new messages, not the system prompt or tools again" do
+      config = sized_config([1_000, 1_200])
+      initial = [Message.user("one")]
+      assert {:ok, first} = Codex.complete(initial, [@tool], config)
+      assert_receive {:invocation, fresh}
+      assert List.last(fresh) =~ "SYSTEM-PROMPT-MARKER"
+      assert List.last(fresh) =~ "TOOL_MARKER"
+
+      history = initial ++ first.messages ++ [Message.user("two")]
+      config = Map.put(config, :provider_state, first.provider_state)
+      assert {:ok, _} = Codex.complete(history, [@tool], config)
+      assert_receive {:invocation, ["exec", "resume" | _] = resumed}
+      assert List.last(resumed) =~ "two"
+      refute List.last(resumed) =~ "SYSTEM-PROMPT-MARKER"
+      refute List.last(resumed) =~ "TOOL_MARKER"
+    end
+
+    test "after Codex compacts its thread, the next turn carries them again" do
+      # The thread grows, then shrinks below half: Codex summarised it.
+      config = sized_config([100_000, 120_000, 40_000, 45_000])
+      history = [Message.user("one")]
+      {:ok, r1} = Codex.complete(history, [@tool], config)
+      assert_receive {:invocation, _}
+
+      step = fn history, prev, text ->
+        history = history ++ prev.messages ++ [Message.user(text)]
+
+        {:ok, r} =
+          Codex.complete(history, [@tool], Map.put(config, :provider_state, prev.provider_state))
+
+        assert_receive {:invocation, args}
+        {history, r, List.last(args)}
+      end
+
+      {h2, r2, p2} = step.(history, r1, "two")
+      refute p2 =~ "TOOL_MARKER"
+      {h3, r3, p3} = step.(h2, r2, "three")
+      refute p3 =~ "TOOL_MARKER"
+      {_h4, _r4, p4} = step.(h3, r3, "four")
+      assert p4 =~ "TOOL_MARKER"
+      assert p4 =~ "SYSTEM-PROMPT-MARKER"
+    end
+
     test "resumes only the new wire history and ignores loop-added provenance" do
       config = session_config()
       initial = [Message.user("original-input")]
@@ -909,7 +994,9 @@ defmodule Alloy.Provider.CodexTest do
       assert args
              |> Enum.chunk_every(2, 1, :discard)
              |> Enum.filter(&match?(["-c", _], &1))
-             |> Enum.map(&List.last/1) == [
+             |> Enum.map(&List.last/1)
+             # Codex's own tools are switched off ahead of the caller's.
+             |> Enum.reject(&String.starts_with?(&1, "features.")) == [
                ~s(cli_auth_credentials_store="keyring"),
                ~s(model_reasoning_effort="high")
              ]
