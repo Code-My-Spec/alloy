@@ -630,6 +630,19 @@ defmodule Alloy.Provider.CodexTest do
       assert input =~ "As sent: {not json}"
     end
 
+    # The repair runs only when the first decode fails, and then on the whole
+    # text: a correctly escaped `\\.` beside a raw newline had its second
+    # backslash doubled as if it began an invalid `\.`, and still did not
+    # decode (CodeMySpec 70e51cc8).
+    test "a valid escaped backslash survives the repair of something else" do
+      raw = ~s({"command":"grep 'Database\\\\.' x\nwc -l"})
+
+      assert {:ok, result} = complete_with_arguments(raw)
+
+      assert [%Message{content: [%{input: %{"command" => "grep 'Database\\.' x\nwc -l"}}]}] =
+               result.messages
+    end
+
     test "a raw newline inside a string in the arguments is read as escaped" do
       raw = ~s({"script":"line one\nline two"})
 

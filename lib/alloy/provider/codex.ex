@@ -119,9 +119,10 @@ defmodule Alloy.Provider.Codex do
   # bounds the wait if it stops responding.
   @reply_grace_ms 5_000
 
-  # Matches any `\X` where X is NOT a valid JSON single-character escape
-  # (valid set: " \ / b f n r t u). Used by the decode repair pass.
-  @invalid_json_escape_re ~r{\\(?!["\\/bfnrtu])}
+  # A backslash and what follows it, as a pair: a valid escape (`\\\\` among
+  # them) is kept whole, so its second backslash is never read as the start of
+  # another; anything else is a lone backslash, doubled.
+  @json_escape_re ~r{\\(["\\/bfnrtu])?}
 
   # sh only wires up redirects: the prompt file on stdin (codex reads it to
   # EOF, which a port cannot send) and stderr to a file, so stdout carries
@@ -209,7 +210,9 @@ defmodule Alloy.Provider.Codex do
     {:error,
      %Error{
        kind: :session_uncertain,
-       message: "Codex resume failed; change :session_generation before continuing: #{reason}"
+       message:
+         "Codex could not resume its saved thread (#{reason}); the next turn starts a new " <>
+           "one with this conversation's history"
      }}
   end
 
@@ -969,7 +972,10 @@ defmodule Alloy.Provider.Codex do
   # doubling the backslash, converting `\X` (invalid) into `\\X` (valid —
   # literal backslash followed by X).
   defp repair_backslash_escapes(json) do
-    Regex.replace(@invalid_json_escape_re, json, fn match -> "\\" <> match end)
+    Regex.replace(@json_escape_re, json, fn
+      "\\", "" -> "\\\\"
+      valid, _escaped -> valid
+    end)
   end
 
   defp emit_chunks(%{messages: [%Message{content: text}]}, on_chunk) when is_binary(text) do
