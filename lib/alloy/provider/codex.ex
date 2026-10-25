@@ -192,6 +192,7 @@ defmodule Alloy.Provider.Codex do
          :ok <- validate_session_workdir(config, codex_home) do
       scope = session_scope(config, codex_home, tool_defs)
       plan = session_plan(config, codex_home, messages, scope)
+      :ok = announce_fresh(plan, messages, Map.get(config, :alloy_on_chunk))
       config = Map.put(config, :alloy_codex_plan, plan)
       prompt = session_prompt(plan, messages, tool_defs, config)
 
@@ -205,6 +206,25 @@ defmodule Alloy.Provider.Codex do
     end
     |> to_provider_error()
   end
+
+  # A new thread partway through a conversation sends the whole transcript
+  # uncached: said on the stream, so whoever watches sees the cost and why.
+  defp announce_fresh({:fresh, reason}, messages, on_chunk)
+       when reason != :ephemeral and is_function(on_chunk, 1) and length(messages) > 1 do
+    on_chunk.(
+      "[new Codex thread: #{fresh_why(reason)}; the whole transcript goes out uncached]\n"
+    )
+
+    :ok
+  end
+
+  defp announce_fresh(_plan, _messages, _on_chunk), do: :ok
+
+  defp fresh_why(:history_or_config_changed),
+    do: "earlier history, the tools or the session generation changed"
+
+  defp fresh_why(:no_session), do: "no saved thread to resume"
+  defp fresh_why(reason), do: to_string(reason)
 
   defp session_result({:error, reason}, {:resume, _id, _count}) do
     {:error,
@@ -307,6 +327,7 @@ defmodule Alloy.Provider.Codex do
           plan,
           Map.get(config, :provider_state)
         )
+        |> CodexSession.note_fresh(plan, messages, Map.get(config, :provider_state))
       end
 
     result

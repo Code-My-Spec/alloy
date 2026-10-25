@@ -3,7 +3,7 @@ defmodule Alloy.Provider.CodexTest do
 
   alias Alloy.Agent.{Config, State, Turn}
   alias Alloy.Message
-  alias Alloy.Provider.{Codex, Error, Retry}
+  alias Alloy.Provider.{Codex, CodexSession, Error, Retry}
 
   describe "opt-in continuation" do
     test "the agent loop resumes after executing a tool" do
@@ -182,6 +182,33 @@ defmodule Alloy.Provider.CodexTest do
       assert List.last(resumed) =~ "two"
       refute List.last(resumed) =~ "SYSTEM-PROMPT-MARKER"
       refute List.last(resumed) =~ "TOOL_MARKER"
+    end
+
+    # A new thread partway through sends the whole transcript uncached: counted
+    # where the caller can see it, and said on the stream (CodeMySpec's token
+    # burn reads the count).
+    test "a new thread mid-conversation is counted and announced; a first turn is not" do
+      config = sized_config([1_000, 1_100])
+      initial = [Message.user("one")]
+      {:ok, first} = Codex.complete(initial, [@tool], config)
+      assert_receive {:invocation, _}
+      assert CodexSession.fresh_threads(first.provider_state) == {0, nil}
+
+      history = initial ++ first.messages ++ [Message.user("two")]
+      parent = self()
+
+      changed =
+        config
+        |> Map.put(:provider_state, first.provider_state)
+        |> Map.put(:system_prompt, "A DIFFERENT PROMPT")
+
+      {:ok, second} =
+        Codex.stream(history, [@tool], changed, fn chunk -> send(parent, {:chunk, chunk}) end)
+
+      assert_receive {:invocation, ["exec", "--json" | _]}
+      assert_receive {:chunk, "[new Codex thread: " <> notice}
+      assert notice =~ "the whole transcript goes out uncached"
+      assert {1, "history_or_config_changed"} = CodexSession.fresh_threads(second.provider_state)
     end
 
     test "after Codex compacts its thread, the next turn carries them again" do

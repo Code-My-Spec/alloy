@@ -57,6 +57,33 @@ defmodule Alloy.Provider.CodexSession do
 
   def note_thread_size(state, _size, _plan, _previous_state), do: state
 
+  @doc """
+  Count a new thread started partway through a conversation: the whole
+  transcript went out uncached. A first turn (nothing before it) is not one.
+  Carried across turns, so a caller can tell from two states whether a turn
+  started one, and why (`fresh_threads/1`).
+  """
+  @spec note_fresh(map(), plan(), [map()], map() | nil) :: map()
+  def note_fresh(state, {:fresh, reason}, messages, previous_state)
+      when reason != :ephemeral and length(messages) > 1 do
+    {count, _reason} = fresh_threads(previous_state)
+    Map.put(state, "fresh_threads", %{"count" => count + 1, "reason" => to_string(reason)})
+  end
+
+  def note_fresh(state, _plan, _messages, previous_state) do
+    case previous_state do
+      %{"fresh_threads" => fresh} -> Map.put(state, "fresh_threads", fresh)
+      _ -> state
+    end
+  end
+
+  @doc "How many mid-conversation threads this session has started, and the last one's reason."
+  @spec fresh_threads(map() | nil) :: {non_neg_integer(), String.t() | nil}
+  def fresh_threads(%{"fresh_threads" => %{"count" => count, "reason" => reason}}),
+    do: {count, reason}
+
+  def fresh_threads(_state), do: {0, nil}
+
   @doc "Whether the next resumed turn should carry the system prompt and tools again."
   @spec resend_static?(map() | nil) :: boolean()
   def resend_static?(%{"codex_session" => %{"resend" => true}}), do: true
