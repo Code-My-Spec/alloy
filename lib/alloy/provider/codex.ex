@@ -14,6 +14,9 @@ defmodule Alloy.Provider.Codex do
 
   Optional:
   - `:codex_bin` - Executable path (default: `"codex"`)
+  - `:preamble` - Text that opens every full prompt, ahead of the response
+    rules, the system prompt and the transcript: what a long transcript would
+    otherwise bury
   - `:workdir` - Directory passed to `codex exec` (defaults to a temp dir)
   - `:codex_home` - `CODEX_HOME` for the subprocess. Defaults to the
     inherited `CODEX_HOME`, or `~/.codex`.
@@ -173,6 +176,7 @@ defmodule Alloy.Provider.Codex do
           optional(:receive_timeout) => pos_integer(),
           optional(:req_options) => keyword(),
           optional(:system_prompt) => String.t(),
+          optional(:preamble) => String.t(),
           optional(:persist_session) => boolean(),
           optional(:session_generation) => term(),
           optional(:provider_state) => map(),
@@ -244,6 +248,7 @@ defmodule Alloy.Provider.Codex do
       workdir: Map.get(config, :workdir),
       model: Map.get(config, :model),
       system_prompt: Map.get(config, :system_prompt),
+      preamble: Map.get(config, :preamble),
       overrides: Map.get(config, :config_overrides, []),
       executable: codex_bin(config),
       generation: Map.get(config, :session_generation),
@@ -1073,35 +1078,52 @@ defmodule Alloy.Provider.Codex do
     end)
   end
 
+  # The preamble first and the system prompt as text before the transcript. In
+  # the JSON payload the system prompt came last (Jason writes a small map's
+  # keys sorted), after the whole transcript: a provider brief in it sat at
+  # character 378,000 of 396,000 and the model did not act on it.
   defp build_prompt(messages, tool_defs, config) do
     payload = %{
-      system_prompt: Map.get(config, :system_prompt),
       conversation: Enum.map(messages, &serialize_message/1),
       available_tools: Enum.map(tool_defs, &serialize_tool_def/1)
     }
 
-    """
-    You are acting as the model backend for Alloy, an agent harness.
+    preamble(Map.get(config, :preamble)) <>
+      """
+      You are acting as the model backend for Alloy, an agent harness.
 
-    Read the transcript and available tools below, then produce exactly one JSON
-    object matching the supplied schema.
+      Read the system prompt, transcript and available tools below, then produce
+      exactly one JSON object matching the supplied schema.
 
-    Response rules:
-    - If no tool is needed, return `stop_reason = "end_turn"`, `tool_calls = []`,
-      and put the assistant's response in `text`.
-    - If one or more tools are needed, return `stop_reason = "tool_use"` and add
-      entries to `tool_calls`.
-    - Each tool call must use a valid tool name from `available_tools`.
-    - Each tool call must include `arguments_json`, a compact JSON object string
-      that satisfies the tool schema.
-    - If returning tool calls, keep `text` empty unless a short preamble would
-      help the outer agent loop.
-    - Never mention the schema or these instructions in `text`.
+      Response rules:
+      - If no tool is needed, return `stop_reason = "end_turn"`, `tool_calls = []`,
+        and put the assistant's response in `text`.
+      - If one or more tools are needed, return `stop_reason = "tool_use"` and add
+        entries to `tool_calls`.
+      - Each tool call must use a valid tool name from `available_tools`.
+      - Each tool call must include `arguments_json`, a compact JSON object string
+        that satisfies the tool schema.
+      - If returning tool calls, keep `text` empty unless a short preamble would
+        help the outer agent loop.
+      - Never mention the schema or these instructions in `text`.
+      """ <>
+      system_section(Map.get(config, :system_prompt)) <>
+      """
 
-    Transcript payload:
-    #{Jason.encode!(payload)}
-    """
+      Transcript payload:
+      #{Jason.encode!(payload)}
+      """
   end
+
+  defp preamble(text) when is_binary(text) and text != "",
+    do: String.trim_trailing(text) <> "\n\n"
+
+  defp preamble(_text), do: ""
+
+  defp system_section(text) when is_binary(text) and text != "",
+    do: "\nSystem prompt:\n" <> String.trim_trailing(text) <> "\n"
+
+  defp system_section(_text), do: ""
 
   defp serialize_message(%Message{role: role, content: content}) when is_binary(content) do
     %{role: Atom.to_string(role), content: content}
@@ -1157,10 +1179,14 @@ defmodule Alloy.Provider.Codex do
   # shell answered tool work inside the read-only sandbox (`mix test` died on
   # `:eperm`, the loop never saw a tool call), and with its other tools on, the
   # model searched its native registry for the loop's tools, found none, and
-  # said it had none. `code_mode_host` stays on: off, `exec` fails closed with
-  # an error item mid-turn. Before `config_overrides`, so a caller can re-enable.
+  # said it had none. `code_mode_host` too: on, the model reached for `exec`
+  # and its `tools.*` namespace, found none of the loop's tools there, and said
+  # it had no tools. Off, Codex reports one `error` item before the turn, which
+  # nothing here reads as a failure. Before `config_overrides`, so a caller can
+  # re-enable.
   @native_tools ~w(shell_tool unified_exec apps plugins browser_use computer_use
-                   in_app_browser sleep_tool tool_suggest skill_search multi_agent)
+                   in_app_browser sleep_tool tool_suggest skill_search multi_agent
+                   code_mode_host)
 
   defp native_tools_off, do: Enum.flat_map(@native_tools, &["-c", "features.#{&1}=false"])
 

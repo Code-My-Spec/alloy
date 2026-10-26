@@ -149,6 +149,27 @@ defmodule Alloy.Provider.CodexTest do
 
     @tool %{name: "TOOL_MARKER", description: "d", input_schema: %{"type" => "object"}}
 
+    # A provider brief in the system prompt sat after the whole transcript, at
+    # character 378,000 of 396,000, and the model went on using Codex's `exec`.
+    test "the preamble opens the prompt, and the system prompt precedes the transcript" do
+      config =
+        [1_000]
+        |> sized_config()
+        |> Map.put(:preamble, "PREAMBLE-MARKER")
+
+      long = String.duplicate("earlier work ", 5_000)
+      messages = [Message.user(long), Message.assistant("ok"), Message.user("next")]
+      {:ok, _} = Codex.complete(messages, [@tool], config)
+      assert_receive {:invocation, args}
+      prompt = List.last(args)
+
+      assert String.starts_with?(prompt, "PREAMBLE-MARKER")
+      {system_at, _} = :binary.match(prompt, "SYSTEM-PROMPT-MARKER")
+      {transcript_at, _} = :binary.match(prompt, "earlier work")
+      assert system_at < transcript_at
+      assert "features.code_mode_host=false" in args
+    end
+
     test "Codex's own tools are off on fresh and resumed turns" do
       config = sized_config([1_000, 1_100])
       initial = [Message.user("one")]
