@@ -328,10 +328,11 @@ defmodule Alloy.Provider.Codex do
         |> wire_history()
         |> CodexSession.remember(scope, id)
         |> CodexSession.note_thread_size(
-          thread_size(command_result),
+          thread_size(command_result, config),
           plan,
           Map.get(config, :provider_state)
         )
+        |> CodexSession.note_usage_total(usage_total(command_result))
         |> CodexSession.note_fresh(plan, messages, Map.get(config, :provider_state))
       end
 
@@ -799,7 +800,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :end_turn,
          messages: [Message.assistant(text)],
-         usage: usage(command_result),
+         usage: usage(command_result, config),
          response_metadata: response_metadata(config, command_result)
        }}
     else
@@ -818,7 +819,7 @@ defmodule Alloy.Provider.Codex do
        %{
          stop_reason: :tool_use,
          messages: [Message.assistant_blocks(blocks)],
-         usage: usage(command_result),
+         usage: usage(command_result, config),
          response_metadata: response_metadata(config, command_result)
        }}
     end
@@ -1029,13 +1030,44 @@ defmodule Alloy.Provider.Codex do
     }
   end
 
-  # Codex runs one turn per exec; its turn.completed event carries the usage.
-  defp usage(%{events: events}) do
-    Enum.reduce(events, @zero_usage, fn
-      %{"type" => "turn.completed", "usage" => %{} = usage}, _acc -> to_usage(usage)
-      _event, acc -> acc
+  # Codex runs one turn per exec, and its turn.completed usage is the thread's
+  # running total: a resumed thread reported everything since it started, and
+  # a loop summing those counted early calls again on every call after
+  # (CodeMySpec recorded 2.8B tokens for an agent whose threads sent 88M).
+  # This exec's share is the total less the one remembered at the last exec.
+  defp usage(command_result, config) do
+    case exec_usage(command_result, config) do
+      nil -> @zero_usage
+      usage -> to_usage(usage)
+    end
+  end
+
+  defp exec_usage(command_result, config) do
+    with %{} = total <- usage_total(command_result) do
+      previous = previous_total(config)
+
+      Map.new(total, fn
+        {key, value} when is_integer(value) ->
+          {key, max(value - Map.get(previous, key, 0), 0)}
+
+        other ->
+          other
+      end)
+    end
+  end
+
+  defp usage_total(%{events: events}) do
+    Enum.find_value(events, fn
+      %{"type" => "turn.completed", "usage" => %{} = usage} -> usage
+      _event -> nil
     end)
   end
+
+  # A fresh thread starts from zero; a resumed one from what it last reported.
+  defp previous_total(%{alloy_codex_plan: {:resume, _id, _count}} = config),
+    do: CodexSession.usage_total(Map.get(config, :provider_state))
+
+  defp previous_total(_config), do: %{}
 
   # Codex reports input_tokens including cache reads and writes; Alloy's
   # input_tokens is uncached input, as for every built-in provider.
@@ -1070,12 +1102,12 @@ defmodule Alloy.Provider.Codex do
 
   defp resend_static?(state), do: CodexSession.resend_static?(state)
 
-  # Codex's input for the turn, cache included: the size of the thread it replayed.
-  defp thread_size(%{events: events}) do
-    Enum.find_value(events, fn
-      %{"type" => "turn.completed", "usage" => %{"input_tokens" => input}} -> input
-      _event -> nil
-    end)
+  # This exec's input, cache included: the size of the thread it replayed.
+  defp thread_size(command_result, config) do
+    case exec_usage(command_result, config) do
+      %{"input_tokens" => input} -> input
+      _none -> nil
+    end
   end
 
   # The preamble first and the system prompt as text before the transcript. In

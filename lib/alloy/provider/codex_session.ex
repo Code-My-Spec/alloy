@@ -58,6 +58,21 @@ defmodule Alloy.Provider.CodexSession do
   def note_thread_size(state, _size, _plan, _previous_state), do: state
 
   @doc """
+  Record the thread's running usage total as Codex last reported it, so the
+  next resumed exec's usage can be told from everything before it.
+  """
+  @spec note_usage_total(map(), map() | nil) :: map()
+  def note_usage_total(%{"codex_session" => %{} = session} = state, %{} = total),
+    do: %{state | "codex_session" => Map.put(session, "usage_total", total)}
+
+  def note_usage_total(state, _total), do: state
+
+  @doc "The running usage total remembered for the saved thread; empty without one."
+  @spec usage_total(map() | nil) :: map()
+  def usage_total(%{"codex_session" => %{"usage_total" => %{} = total}}), do: total
+  def usage_total(_state), do: %{}
+
+  @doc """
   Count a new thread started partway through a conversation: the whole
   transcript went out uncached. A first turn (nothing before it) is not one.
   Carried across turns, so a caller can tell from two states whether a turn

@@ -125,7 +125,8 @@ defmodule Alloy.Provider.CodexTest do
              }
     end
 
-    # A sized runner: each turn reports `input_tokens` from `sizes`, in order.
+    # A sized runner: each turn reports `input_tokens` from `sizes`, in order,
+    # as Codex does: the thread's running total.
     defp sized_config(sizes) do
       parent = self()
       {:ok, counter} = Agent.start_link(fn -> sizes end)
@@ -233,8 +234,9 @@ defmodule Alloy.Provider.CodexTest do
     end
 
     test "after Codex compacts its thread, the next turn carries them again" do
-      # The thread grows, then shrinks below half: Codex summarised it.
-      config = sized_config([100_000, 120_000, 40_000, 45_000])
+      # Running totals: each exec sends 100k, 120k, then 40k and 45k, below
+      # half the last, so Codex summarised its thread.
+      config = sized_config([100_000, 220_000, 260_000, 305_000])
       history = [Message.user("one")]
       {:ok, r1} = Codex.complete(history, [@tool], config)
       assert_receive {:invocation, _}
@@ -256,6 +258,47 @@ defmodule Alloy.Provider.CodexTest do
       {_h4, _r4, p4} = step.(h3, r3, "four")
       assert p4 =~ "TOOL_MARKER"
       assert p4 =~ "SYSTEM-PROMPT-MARKER"
+    end
+
+    # codex-cli 0.164.0 against one thread, three execs: turn.completed carried
+    # 64,293, then 118,707, then 184,431 input tokens, the thread's running
+    # total, while the rollout's own per-call counts added up to 64,293,
+    # 54,414 and 65,724.
+    test "a resumed exec reports only its own usage, not the thread's running total" do
+      config = sized_config([64_293, 118_707, 184_431])
+      history = [Message.user("one")]
+      {:ok, first} = Codex.complete(history, [@tool], config)
+      assert first.usage.input_tokens == 64_293
+
+      history = history ++ first.messages ++ [Message.user("two")]
+
+      {:ok, second} =
+        Codex.complete(history, [@tool], Map.put(config, :provider_state, first.provider_state))
+
+      assert second.usage.input_tokens == 54_414
+
+      history = history ++ second.messages ++ [Message.user("three")]
+
+      {:ok, third} =
+        Codex.complete(history, [@tool], Map.put(config, :provider_state, second.provider_state))
+
+      assert third.usage.input_tokens == 65_724
+    end
+
+    test "a new thread's usage starts from zero, whatever the last thread reached" do
+      config = sized_config([500_000, 30_000])
+      history = [Message.user("one")]
+      {:ok, first} = Codex.complete(history, [@tool], config)
+
+      changed =
+        config
+        |> Map.put(:provider_state, first.provider_state)
+        |> Map.put(:system_prompt, "A DIFFERENT PROMPT")
+
+      {:ok, second} =
+        Codex.complete(history ++ first.messages ++ [Message.user("two")], [@tool], changed)
+
+      assert second.usage.input_tokens == 30_000
     end
 
     test "resumes only the new wire history and ignores loop-added provenance" do
